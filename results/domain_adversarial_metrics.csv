@@ -1,0 +1,6 @@
+Domain,Architecture,Condition,Evaluation_Space,MAPE_%,Median_MAPE_%,RMSE_cycles,R2
+Stanford LFP (Source),Koopman Neural Operator (KNO),5-Fold GroupKFold CV (Leakage-Free),Linear (Cycles),30.198033452033997,29.307851195335388,0.0,0.0
+Oxford LCO,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),Linear (Cycles),16.218510270118713,13.438530921936035,169.96917229677268,-0.1664445400238037
+Oxford LCO,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,Linear (Cycles),8.281192183494568,4.456051826477051,104.55511218670755,0.5586183071136475
+CALCE NMC,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),Linear (Cycles),26.071935892105103,35.307071685791016,293.8041173554244,-2.268986701965332
+CALCE NMC,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,Linear (Cycles),17.815111577510834,20.61781120300293,172.49600312398545,-0.1268223524093628

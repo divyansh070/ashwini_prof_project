@@ -63,33 +63,43 @@ class BatterySOCDataset(Dataset):
 
 
 def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device):
+    """
+    Evaluates model predictions in LINEAR SPACE (Cycles) to avoid 'The Log-Space Evaluation Trap'.
+    Targets and predictions are inverse-transformed from log10 space via 10**y before computing MAPE, RMSE, and R2.
+    """
     model.eval()
-    y_true_list, y_pred_list = [], []
-    knee_true_list, knee_pred_list = [], []
+    y_true_lin_list, y_pred_lin_list = [], []
+    knee_true_lin_list, knee_pred_lin_list = [], []
     with torch.no_grad():
         for x_batch, y_log_batch, k_log_batch in loader:
             x_batch = x_batch.to(device)
             pred_log_eol, pred_log_knee, _, _, _ = model(x_batch, alpha=0.0)
-            pred_log_np = pred_log_eol.cpu().numpy().flatten()
-            pred_eol = 10**(pred_log_np)
-            y_true_list.extend(10**(y_log_batch.numpy().flatten()))
-            y_pred_list.extend(pred_eol)
             
-            knee_true_list.extend(10**(k_log_batch.numpy().flatten()))
-            knee_pred_list.extend(10**(pred_log_knee.cpu().numpy().flatten()))
+            # INVERSE-TRANSFORM from log10 space back to linear space (Cycles)
+            y_pred_lin = 10 ** (pred_log_eol.cpu().numpy().flatten())
+            y_true_lin = 10 ** (y_log_batch.numpy().flatten())
+            
+            knee_pred_lin = 10 ** (pred_log_knee.cpu().numpy().flatten())
+            knee_true_lin = 10 ** (k_log_batch.numpy().flatten())
 
-    y_true = np.array(y_true_list)
-    y_pred = np.array(y_pred_list)
-    knee_true = np.array(knee_true_list)
-    knee_pred = np.array(knee_pred_list)
+            y_true_lin_list.extend(y_true_lin)
+            y_pred_lin_list.extend(y_pred_lin)
+            knee_true_lin_list.extend(knee_true_lin)
+            knee_pred_lin_list.extend(knee_pred_lin)
 
-    mape = mean_absolute_percentage_error(y_true, y_pred) * 100.0
-    abs_err_pct = np.abs(y_true - y_pred) / y_true * 100.0
+    y_true_lin = np.array(y_true_lin_list)
+    y_pred_lin = np.array(y_pred_lin_list)
+    knee_true_lin = np.array(knee_true_lin_list)
+    knee_pred_lin = np.array(knee_pred_lin_list)
+
+    # Compute ALL metrics strictly in LINEAR SPACE (Cycles)
+    mape = mean_absolute_percentage_error(y_true_lin, y_pred_lin) * 100.0
+    abs_err_pct = np.abs(y_true_lin - y_pred_lin) / y_true_lin * 100.0
     median_mape = np.median(abs_err_pct)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    r2 = r2_score(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true_lin, y_pred_lin))
+    r2 = r2_score(y_true_lin, y_pred_lin)
     
-    mape_knee = mean_absolute_percentage_error(knee_true, knee_pred) * 100.0
+    mape_knee = mean_absolute_percentage_error(knee_true_lin, knee_pred_lin) * 100.0
     
     return {
         "MAPE_%": mape,
@@ -97,8 +107,8 @@ def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device):
         "RMSE_cycles": rmse,
         "R2": r2,
         "Knee_MAPE_%": mape_knee,
-        "y_true": y_true,
-        "y_pred": y_pred
+        "y_true": y_true_lin,
+        "y_pred": y_pred_lin
     }
 
 
@@ -245,6 +255,7 @@ def run_5fold_benchmark_on_dataset(
         "Dataset": dataset_label,
         "Total_Cells_N": N_cells,
         "Validation_Protocol": "5-Fold GroupKFold CV (Leak-Free)",
+        "Evaluation_Space": "Linear (Cycles)",
         "MAPE_%": mean_mape,
         "Median_MAPE_%": mean_median,
         "RMSE_cycles": mean_rmse,

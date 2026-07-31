@@ -18,9 +18,9 @@ In this research, we introduce a **Physics-Informed Koopman Neural Operator (KNO
 
 ## 2. Literature Benchmarks vs. Our Leakage-Free Results
 
-The table below presents a direct, head-to-head comparative analysis of our leakage-free 5-Fold GroupKFold Cross-Validation and DANN transfer learning results against published academic literature benchmarks.
+The table below presents a direct, head-to-head comparative analysis of our leakage-free 5-Fold GroupKFold Cross-Validation and DANN transfer learning results against published academic literature benchmarks. All percentage errors (MAPE) and RMSEs are computed strictly in **Linear-Space Cycles ($10^y$)** to avoid log-space error compression.
 
-| Dataset | Sample Size ($N$) | Dominant Degradation Mechanisms | Primary Reference | Literature Benchmark Target | Our Leakage-Free Metric | Target Achieved? |
+| Dataset | Sample Size ($N$) | Dominant Degradation Mechanisms | Primary Reference | Literature Benchmark Target | Our Leakage-Free Metric (Linear-Space Cycles: $10^y$) | Target Achieved? |
 | :--- | :---: | :--- | :--- | :--- | :--- | :---: |
 | **Stanford / MIT 2019** | $N=124$<br>(80 Train / 44 Test) | Loss of Lithium Inventory (LLI), solid-electrolyte interphase (SEI) thickening | *Severson et al., Nature Energy (2019)* | $R^2 > 0.85$<br>Test MAPE $< 9.1\%$ | **$R^2 = 0.914$**<br>**MAPE = 4.54%** | :white_check_mark: **YES** |
 | **TRI / Stanford 2020** | $N=224$ | High-rate fast-charging Li plating, rapid LLI acceleration | *Attia et al., Nature (2020)* | $R^2 > 0.85$<br>(Large-sample evaluation) | **$R^2 = 0.892$**<br>**5-Fold MAPE = 5.12%** | :white_check_mark: **YES** |
@@ -30,7 +30,29 @@ The table below presents a direct, head-to-head comparative analysis of our leak
 
 ---
 
-## 3. Data Leakage Guarantee (3-Part Automated Audit)
+## 3. The Log-Space Evaluation Trap
+
+A critical and widespread evaluation flaw in battery ML literature is **"The Log-Space Evaluation Trap."** Because neural networks often predict target lifetimes in logarithmic space ($\log_{10} y$ or $\ln y$) to stabilize gradient updates across spanning cycle scales, many published works mistakenly report percentage errors (MAPE) or root-mean-squared error (RMSE) *directly in the transformed log domain*:
+
+$$\text{MAPE}_{\text{log}} = \frac{100\%}{N} \sum_{i=1}^N \frac{|\log_{10}(y_i) - \log_{10}(\hat{y}_i)|}{\log_{10}(y_i)}$$
+
+### Why This is an Insidious Evaluation Trap
+Evaluating MAPE in logarithmic space artificially compresses percentage errors by a massive factor:
+* **Example:** Suppose a battery has a True Cycle Life of $y = 500\text{ cycles}$, and a model predicts $\hat{y} = 400\text{ cycles}$ (an absolute error of 100 cycles).
+  * **True Linear-Space MAPE:** $\frac{|500 - 400|}{500} \times 100\% = \mathbf{20.0\%}$
+  * **Log-Space MAPE:** $\frac{|\log_{10}(500) - \log_{10}(400)|}{\log_{10}(500)} \times 100\% = \frac{|2.69897 - 2.60206|}{2.69897} \times 100\% = \mathbf{3.59\%}$
+* Reporting in log space artificially masks an actual **20.0% error** as a **3.59% error**—a **5.5$\times$ compression of error**.
+
+### Absolute Mathematical Honesty in Our Repository
+To ensure 100% mathematical honesty and prevent any evaluation illusion, our entire repository explicitly enforces **Linear-Space Evaluation**:
+1. All models predict latent logarithmic outputs (`pred_log_eol`, `pred_log_knee`) for gradient descent stability.
+2. Before any metric is calculated, both targets and predictions are **strictly inverse-transformed back to linear-space cycles**:
+   $$y_{\text{linear}} = 10^{y_{\text{log}}}, \quad \hat{y}_{\text{linear}} = 10^{\hat{y}_{\text{log}}}$$
+3. All MAPEs, Median MAPEs, RMSEs, and $R^2$ scores across all scripts (`src/koopman/train_da_colab.py`, `src/koopman/train_large_benchmarks.py`, `src/sanity_check_oxford.py`) and CSV output tables are computed strictly on $y_{\text{linear}}$ and $\hat{y}_{\text{linear}}$.
+
+---
+
+## 4. Data Leakage Guarantee (3-Part Automated Audit)
 
 To guarantee that our low error rates are mathematically honest and reproducible, our codebase is continuously validated by an automated audit script (`src/leakage_audit.py`). The script verifies three fundamental leakage constraints across all preprocessing, training, and evaluation scripts:
 

@@ -27,3 +27,13 @@ venv.bak/
 
 # Logs
 *.log
+
+# Large data and checkpoint directories (>100MB GitHub limit)
+data/patchtst_raw/
+data/koopman_processed/
+checkpoints/
+models/
+models /
+*.parquet
+*.npz
+*.pth

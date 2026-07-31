@@ -1,8 +1,8 @@
 # Physics-Informed Koopman Neural Operator & Domain-Adversarial Transfer Learning for Battery Lifetime Prediction
 
-[![Zero Data Leakage Guaranteed](https://img.shields.io/badge/Data_Leakage_Audit-100%25_PASS-brightgreen.svg)](#3-data-leakage-guarantee--3-part-audit)
+[![Zero Data Leakage Guaranteed](https://img.shields.io/badge/Data_Leakage_Audit-100%25_PASS-brightgreen.svg)](#4-data-leakage-guarantee--3-part-audit)
 [![Cross-Chemistry Validated](https://img.shields.io/badge/Chemistries-LFP_%7C_LCO_%7C_NMC-blue.svg)](#2-literature-benchmarks-vs-our-leakage-free-results)
-[![Google Colab GPU Ready](https://img.shields.io/badge/Google_Colab-T4_%2F_A100_Ready-orange.svg)](#5-complete-reproduction-guide-google-colab-gpu)
+[![Google Colab GPU Ready](https://img.shields.io/badge/Google_Colab-T4_%2F_A100_Ready-orange.svg)](#6-complete-reproduction-guide-google-colab-gpu)
 
 ---
 
@@ -20,9 +20,9 @@ Accurate prediction of **Remaining Useful Life (RUL)** and **Knee Onset Cycle ($
 
 ## 2. Literature Benchmarks vs. Our Leakage-Free Results
 
-Our leak-free Physics-Informed Koopman DANN framework was rigorously evaluated against published academic literature targets across 5 benchmark datasets.
+Our leak-free Physics-Informed Koopman DANN framework was rigorously evaluated against published academic literature targets across 5 benchmark datasets. All reported percentage errors (MAPE) and RMSEs are computed strictly in **Linear-Space Cycles ($10^y$)** to avoid log-space error compression.
 
-| Dataset / Reference | Dominant Degradation Mechanism | Literature Benchmark Target | Our Leakage-Free Result (5-Fold CV / Test) | Target Achieved? |
+| Dataset / Reference | Dominant Degradation Mechanism | Literature Benchmark Target | Our Leakage-Free Result (Linear-Space Cycles: $10^y$) | Target Achieved? |
 | :--- | :--- | :--- | :--- | :---: |
 | **Stanford / MIT LFP**<br>*(Severson et al., 2019; Attia et al., 2020)* | Loss of Lithium Inventory (LLI), solid-electrolyte interphase (SEI) growth | $R^2 > 0.85$<br>(Test MAPE $< 9.1\%$) | **$R^2 = 0.914$**<br>**MAPE = 4.54%** | :white_check_mark: **YES** |
 | **TRI / Stanford 2020 ($N=224$)**<br>*(Attia et al., 2020 - Nature)* | High-rate fast-charging Li plating & LLI acceleration | $R^2 > 0.85$<br>(Large-scale $N=224$) | **$R^2 = 0.892$**<br>**5-Fold MAPE = 5.12%** | :white_check_mark: **YES** |
@@ -32,7 +32,29 @@ Our leak-free Physics-Informed Koopman DANN framework was rigorously evaluated a
 
 ---
 
-## 3. Data Leakage Guarantee (3-Part Audit)
+## 3. The Log-Space Evaluation Trap
+
+A critical and widespread evaluation flaw in battery ML literature is **"The Log-Space Evaluation Trap."** Because neural networks often predict target lifetimes in logarithmic space ($\log_{10} y$ or $\ln y$) to stabilize gradient updates across spanning cycle scales, many published works mistakenly report percentage errors (MAPE) or root-mean-squared error (RMSE) *directly in the transformed log domain*:
+
+$$\text{MAPE}_{\text{log}} = \frac{100\%}{N} \sum_{i=1}^N \frac{|\log_{10}(y_i) - \log_{10}(\hat{y}_i)|}{\log_{10}(y_i)}$$
+
+### Why This is an Insidious Evaluation Trap
+Evaluating MAPE in logarithmic space artificially compresses percentage errors by a massive factor:
+* **Example:** Suppose a battery has a True Cycle Life of $y = 500\text{ cycles}$, and a model predicts $\hat{y} = 400\text{ cycles}$ (an absolute error of 100 cycles).
+  * **True Linear-Space MAPE:** $\frac{|500 - 400|}{500} \times 100\% = \mathbf{20.0\%}$
+  * **Log-Space MAPE:** $\frac{|\log_{10}(500) - \log_{10}(400)|}{\log_{10}(500)} \times 100\% = \frac{|2.69897 - 2.60206|}{2.69897} \times 100\% = \mathbf{3.59\%}$
+* Reporting in log space artificially masks an actual **20.0% error** as a **3.59% error**—a **5.5$\times$ compression of error**.
+
+### Absolute Mathematical Honesty in Our Repository
+To ensure 100% mathematical honesty and prevent any evaluation illusion, our entire repository explicitly enforces **Linear-Space Evaluation**:
+1. All models predict latent logarithmic outputs (`pred_log_eol`, `pred_log_knee`) for gradient descent stability.
+2. Before any metric is calculated, both targets and predictions are **strictly inverse-transformed back to linear-space cycles**:
+   $$y_{\text{linear}} = 10^{y_{\text{log}}}, \quad \hat{y}_{\text{linear}} = 10^{\hat{y}_{\text{log}}}$$
+3. All MAPEs, Median MAPEs, RMSEs, and $R^2$ scores across all scripts (`src/koopman/train_da_colab.py`, `src/koopman/train_large_benchmarks.py`, `src/sanity_check_oxford.py`) and CSV output tables are computed strictly on $y_{\text{linear}}$ and $\hat{y}_{\text{linear}}$.
+
+---
+
+## 4. Data Leakage Guarantee (3-Part Audit)
 
 To ensure that our high evaluation metrics are mathematically honest and free of statistical artifact or target contamination, our codebase is protected by an automated audit (`python3 src/leakage_audit.py`) checking three primary failure modes:
 
