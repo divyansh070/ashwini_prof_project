@@ -184,7 +184,8 @@ def train_dann_loop(
     lambda_mono: float,
     lambda_dann: float,
     device: torch.device,
-    target_name: str
+    target_name: str,
+    patience: int = 10
 ):
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
@@ -194,8 +195,9 @@ def train_dann_loop(
 
     best_val_loss = float("inf")
     best_weights = None
+    patience_counter = 0
 
-    logger.info(f"[{target_name}] Starting Domain-Adversarial Transfer Learning (DANN) for {epochs} epochs...")
+    logger.info(f"[{target_name}] Starting Domain-Adversarial Transfer Learning (DANN) for {epochs} epochs (Early Stopping Patience={patience})...")
     total_steps = epochs * max(len(source_loader), len(target_loader))
     current_step = 0
 
@@ -266,14 +268,22 @@ def train_dann_loop(
                 val_mse += criterion_mse(pred_v, y_v).item() * len(x_v)
         val_mse /= len(target_val_loader.dataset)
 
-        if val_mse < best_val_loss:
+        if val_mse < best_val_loss - 1e-6:
             best_val_loss = val_mse
             best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-        if ep % 10 == 0 or ep == epochs:
+        if ep % 10 == 0 or ep == epochs or patience_counter >= patience:
             logger.info(f"  [Epoch {ep:03d}/{epochs:03d}] alpha={alpha:.2f} | Src MSE: {tr_mse:.4f} | Dom Loss: {tr_dom:.4f} | Tgt Val MSE: {val_mse:.4f}")
 
-    model.load_state_dict(best_weights)
+        if patience_counter >= patience:
+            logger.info(f"  [Early Stopping] Target Val MSE did not improve for {patience} epochs. Stopping early at epoch {ep}.")
+            break
+
+    if best_weights is not None:
+        model.load_state_dict(best_weights)
     return model
 
 
@@ -311,7 +321,7 @@ def main():
 
     logger.info("\n--- PHASE 1: SOURCE DOMAIN 5-FOLD GROUPKFOLD CV (Stanford/MIT LFP) ---")
     gkf = GroupKFold(n_splits=5)
-    fold_mapes = []
+    fold_mapes, fold_medians, fold_rmses, fold_r2s = [], [], [], []
     
     source_model = BatteryKoopmanDANN(in_features=200, num_cycles=46, d_model=64).to(device)
 
@@ -343,13 +353,19 @@ def main():
         fold_metrics = evaluate_model(fold_model, loader_te, device=device)
         logger.info(f"  [Fold {fold} Test] MAPE: {fold_metrics['MAPE_%']:.2f}% | Median MAPE: {fold_metrics['Median_MAPE_%']:.2f}% | Knee MAPE: {fold_metrics['Knee_MAPE_%']:.2f}% | R²: {fold_metrics['R2']:.3f}")
         fold_mapes.append(fold_metrics["MAPE_%"])
+        fold_medians.append(fold_metrics["Median_MAPE_%"])
+        fold_rmses.append(fold_metrics["RMSE_cycles"])
+        fold_r2s.append(fold_metrics["R2"])
 
         if fold == 0:
             source_model.load_state_dict(fold_model.state_dict())
             source_mean_train, source_std_train = mean_fold, std_fold
 
     mean_cv_mape = np.mean(fold_mapes)
-    logger.info(f"\n[Stanford LFP 5-Fold GroupKFold CV Result] Mean Test MAPE: {mean_cv_mape:.2f}%")
+    mean_cv_median = np.mean(fold_medians)
+    mean_cv_rmse = np.mean(fold_rmses)
+    mean_cv_r2 = np.mean(fold_r2s)
+    logger.info(f"\n[Stanford LFP 5-Fold GroupKFold CV Result] Mean Test MAPE: {mean_cv_mape:.2f}% | Median MAPE: {mean_cv_median:.2f}% | RMSE: {mean_cv_rmse:.2f} | R²: {mean_cv_r2:.3f}")
 
     src_ckpt = "checkpoints/koopman_dann_stanford_source.pth"
     torch.save(source_model.state_dict(), src_ckpt)
@@ -360,9 +376,9 @@ def main():
         "Condition": "5-Fold GroupKFold CV (Leakage-Free)",
         "Evaluation_Space": "Linear (Cycles)",
         "MAPE_%": mean_cv_mape,
-        "Median_MAPE_%": np.median(fold_mapes),
-        "RMSE_cycles": 0.0,
-        "R2": 0.0
+        "Median_MAPE_%": mean_cv_median,
+        "RMSE_cycles": mean_cv_rmse,
+        "R2": mean_cv_r2
     }]
 
     targets = [
