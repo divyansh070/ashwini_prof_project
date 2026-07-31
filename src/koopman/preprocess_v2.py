@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Universal Domain Normalization Preprocessing Module (preprocess_v2.py).
+Universal Domain Normalization Preprocessing Module (preprocess_v2.py) - LEAKAGE-FREE.
 Solves absolute voltage domain mismatch across LFP, LCO, and NMC chemistries by normalizing
 the x-axis from Absolute Voltage to State of Charge (SOC) in [0.0, 1.0] and calculating
 differential capacity embeddings as dQ/d(SOC).
-This guarantees that invariant electrochemical phase-transition peaks align across chemistries,
-providing a unified domain-invariant feature space for Koopman Neural Operators.
+
+CRITICAL LEAKAGE PREVENTIONS:
+  - Preserves RAW unscaled universal dQ/d(SOC) matrices.
+  - Zero statistical standardization (mean/std/StandardScaler) is applied across the dataset before splitting.
+  - All normalization parameters must be fit strictly within training folds during downstream model evaluation.
 
 Outputs compressed tensor archives to `data/koopman_processed/`:
   - stanford_lfp_soc.npz
@@ -92,13 +95,14 @@ def compute_universal_dq_dsoc(v_raw: np.ndarray, q_raw: np.ndarray, chem: str) -
 
 def preprocess_dataset(df: pd.DataFrame, chem: str, out_path: str):
     """
-    Constructs universal SOC normalized 2D matrices (num_cells, 46, 200) for Koopman Neural Operators.
+    Constructs universal SOC raw 2D matrices (num_cells, 46, 200) for Koopman Neural Operators.
+    No global dataset standardizations are applied here to guarantee zero scaling leakage.
     """
     logger.info(f"Universal SOC Normalization for {chem} dataset (Rows: {len(df)})...")
     cells = sorted(df["cell_id"].unique())
     N = len(cells)
 
-    matrices_soc = np.zeros((N, len(CYCLES_EVAL), L_GRID), dtype=np.float32)
+    matrices_soc_raw = np.zeros((N, len(CYCLES_EVAL), L_GRID), dtype=np.float32)
     y_eol = np.zeros(N, dtype=np.float32)
 
     for idx, cell in enumerate(cells):
@@ -116,29 +120,24 @@ def preprocess_dataset(df: pd.DataFrame, chem: str, out_path: str):
                     cyc_df["capacity_Ah"].values,
                     chem=chem
                 )
-            matrices_soc[idx, c_idx, :] = dq_dsoc
+            matrices_soc_raw[idx, c_idx, :] = dq_dsoc
 
-    # Global standardization across the dataset
-    mean_val = np.mean(matrices_soc)
-    std_val = np.std(matrices_soc) + 1e-8
-    matrices_soc_norm = (matrices_soc - mean_val) / std_val
-
+    # LEAKAGE-FREE ARCHIVING: Save raw unscaled features.
+    # Standard deviation/mean scaling MUST occur dynamically within each Train fold.
     np.savez_compressed(
         out_path,
-        matrices_soc=matrices_soc_norm,
+        matrices_soc=matrices_soc_raw,
         y_eol=y_eol,
         cells=cells,
         chemistry=chem,
-        soc_grid=SOC_GRID,
-        mean_val=mean_val,
-        std_val=std_val
+        soc_grid=SOC_GRID
     )
-    logger.info(f"Saved universal {chem} SOC preprocessed tensor -> {out_path} (Shape: {matrices_soc_norm.shape})")
-    return matrices_soc_norm, y_eol
+    logger.info(f"Saved raw universal {chem} SOC preprocessed tensor -> {out_path} (Shape: {matrices_soc_raw.shape})")
+    return matrices_soc_raw, y_eol
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Universal Domain Normalization for Koopman & DANN")
+    parser = argparse.ArgumentParser(description="Universal Domain Normalization for Koopman & DANN (Leakage-Free)")
     parser.add_argument("--in-dir", type=str, default="data/patchtst_raw", help="Input raw parquet directory")
     parser.add_argument("--out-dir", type=str, default="data/koopman_processed", help="Output directory")
     args = parser.parse_args()
@@ -167,7 +166,7 @@ def main():
         preprocess_dataset(df_nmc, "NMC", os.path.join(args.out_dir, "calce_nmc_soc.npz"))
 
     logger.info("======================================================================")
-    logger.info("UNIVERSAL DOMAIN NORMALIZATION COMPLETED SUCCESSFULLY")
+    logger.info("UNIVERSAL DOMAIN NORMALIZATION COMPLETED SUCCESSFULLY (ZERO LEAKAGE)")
     logger.info("======================================================================")
 
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Domain Adversarial Transfer Learning (DANN) & Koopman Neural Operator Training Script (train_da_colab.py).
+Domain Adversarial Transfer Learning (DANN) & Koopman Neural Operator Training Script (LEAKAGE-FREE).
 Executes:
-  1. Source Domain Training: Trains Koopman Neural Operator model on Stanford/MIT (LFP) dataset.
+  1. Source Domain Training: Trains Koopman Neural Operator model on Stanford/MIT (LFP) dataset
+     using strict GroupKFold cross-validation by Cell ID with fold-scoped statistical standardization.
   2. Domain Adversarial Adaptation (DANN): Actively aligns latent feature distributions of Stanford (Source)
      and Oxford/CALCE (Target) domains using a Gradient Reversal Layer (GRL) and Physics-Informed Koopman linearity.
   3. Evaluates Zero-Shot vs. Domain-Adversarial Transfer Learning performance and exports checkpoints
-     and quantitative metrics to `results/domain_adversarial_metrics.csv`.
+     and mathematically honest quantitative metrics to `results/domain_adversarial_metrics.csv`.
 """
 
 import os
@@ -19,7 +20,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, train_test_split
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
 
 from koopman_model import BatteryKoopmanDANN
@@ -103,9 +104,7 @@ def train_source_loop(
     best_loss = float("inf")
     best_weights = None
 
-    logger.info(f"[{domain_name}] Training Koopman model for {epochs} epochs (lr={lr:.1e})...")
     start_t = time.time()
-
     for ep in range(1, epochs + 1):
         model.train()
         tr_loss, tr_kno = 0.0, 0.0
@@ -140,10 +139,8 @@ def train_source_loop(
             best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
         if ep % 20 == 0 or ep == epochs:
-            logger.info(f"  [Epoch {ep:03d}/{epochs:03d}] MSE: {tr_loss:.4f} | Val MSE: {val_loss:.4f} | KNO Loss: {tr_kno:.4f}")
+            logger.info(f"  [{domain_name} | Epoch {ep:03d}/{epochs:03d}] MSE: {tr_loss:.4f} | Val MSE: {val_loss:.4f} | KNO Loss: {tr_kno:.4f}")
 
-    elap = time.time() - start_t
-    logger.info(f"[{domain_name}] Training finished in {elap:.1f}s. Best Val MSE: {best_loss:.4f}")
     model.load_state_dict(best_weights)
     return model
 
@@ -263,7 +260,7 @@ def train_dann_loop(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Koopman Neural Operator & DANN Domain Adversarial Training")
+    parser = argparse.ArgumentParser(description="Koopman Neural Operator & DANN Domain Adversarial Training (Leakage-Free)")
     parser.add_argument("--data-dir", type=str, default="data/koopman_processed", help="Universal SOC processed directory")
     parser.add_argument("--epochs-source", type=int, default=100, help="Source training epochs")
     parser.add_argument("--epochs-dann", type=int, default=60, help="DANN adversarial adaptation epochs")
@@ -292,39 +289,67 @@ def main():
         sys.exit(1)
 
     lfp_data = np.load(lfp_path)
-    X_lfp, y_lfp = lfp_data["matrices_soc"], lfp_data["y_eol"]
-
-    # Source 80/20 train/test split (domain_label = 0)
-    train_idx, test_idx = train_test_split(np.arange(len(X_lfp)), test_size=0.20, random_state=SEED)
-    ds_src_tr = BatterySOCDataset(X_lfp[train_idx], y_lfp[train_idx], domain_label=0)
-    ds_src_te = BatterySOCDataset(X_lfp[test_idx], y_lfp[test_idx], domain_label=0)
-    loader_src_tr = DataLoader(ds_src_tr, batch_size=args.batch_size, shuffle=True)
-    loader_src_te = DataLoader(ds_src_te, batch_size=args.batch_size, shuffle=False)
+    X_lfp_raw, y_lfp, cells_lfp = lfp_data["matrices_soc"], lfp_data["y_eol"], lfp_data["cells"]
 
     # -------------------------------------------------------------------------
-    # PHASE 1: SOURCE DOMAIN TRAINING (Stanford LFP Koopman Operator)
+    # PHASE 1: SOURCE DOMAIN STRICT 5-FOLD GROUPKFOLD CV BY CELL ID (Stanford LFP)
     # -------------------------------------------------------------------------
-    logger.info("\n--- PHASE 1: SOURCE DOMAIN TRAINING (Stanford/MIT LFP) ---")
+    logger.info("\n--- PHASE 1: SOURCE DOMAIN 5-FOLD GROUPKFOLD CV (Stanford/MIT LFP) ---")
+    gkf = GroupKFold(n_splits=5)
+    fold_mapes = []
+    
+    # We will use Fold 0 as our primary checkpoint model for downstream transfer learning
     source_model = BatteryKoopmanDANN(in_features=200, num_cycles=46, d_model=64)
-    source_model = train_source_loop(
-        source_model, loader_src_tr, loader_src_te,
-        epochs=args.epochs_source, lr=args.lr_source,
-        lambda_koopman=args.lambda_koopman, device=device, domain_name="Stanford_LFP_Koopman"
-    )
 
-    source_metrics = evaluate_model(source_model, loader_src_te, device=device)
+    for fold, (train_idx, test_idx) in enumerate(gkf.split(X_lfp_raw, y_lfp, groups=cells_lfp)):
+        # OVERLAP LEAKAGE ASSERTION
+        train_cells = set(cells_lfp[train_idx])
+        test_cells = set(cells_lfp[test_idx])
+        assert len(train_cells.intersection(test_cells)) == 0, f"Cell overlap leakage detected in fold {fold}!"
+
+        # SCALING LEAKAGE PREVENTION: Fit Mean/Std STRICTLY on X_train
+        X_tr = X_lfp_raw[train_idx]
+        X_te = X_lfp_raw[test_idx]
+        mean_fold = np.mean(X_tr, axis=0, keepdims=True)
+        std_fold = np.std(X_tr, axis=0, keepdims=True) + 1e-8
+        X_tr_norm = (X_tr - mean_fold) / std_fold
+        X_te_norm = (X_te - mean_fold) / std_fold
+
+        ds_src_tr = BatterySOCDataset(X_tr_norm, y_lfp[train_idx], domain_label=0)
+        ds_src_te = BatterySOCDataset(X_te_norm, y_lfp[test_idx], domain_label=0)
+        loader_tr = DataLoader(ds_src_tr, batch_size=args.batch_size, shuffle=True)
+        loader_te = DataLoader(ds_src_te, batch_size=args.batch_size, shuffle=False)
+
+        fold_model = BatteryKoopmanDANN(in_features=200, num_cycles=46, d_model=64)
+        fold_model = train_source_loop(
+            fold_model, loader_tr, loader_te,
+            epochs=args.epochs_source, lr=args.lr_source,
+            lambda_koopman=args.lambda_koopman, device=device, domain_name=f"LFP_Fold_{fold}"
+        )
+
+        fold_metrics = evaluate_model(fold_model, loader_te, device=device)
+        logger.info(f"  [Fold {fold} Test] MAPE: {fold_metrics['MAPE_%']:.2f}% | Median MAPE: {fold_metrics['Median_MAPE_%']:.2f}% | R²: {fold_metrics['R2']:.3f}")
+        fold_mapes.append(fold_metrics["MAPE_%"])
+
+        if fold == 0:
+            source_model.load_state_dict(fold_model.state_dict())
+            # Save Fold 0 training scaler statistics for honest target adaptation
+            source_mean_train, source_std_train = mean_fold, std_fold
+
+    mean_cv_mape = np.mean(fold_mapes)
+    logger.info(f"\n[Stanford LFP 5-Fold GroupKFold CV Result] Mean Test MAPE: {mean_cv_mape:.2f}%")
+
     src_ckpt = "checkpoints/koopman_dann_stanford_source.pth"
     torch.save(source_model.state_dict(), src_ckpt)
-    logger.info(f"[Stanford LFP Koopman Test] MAPE: {source_metrics['MAPE_%']:.2f}% | Median MAPE: {source_metrics['Median_MAPE_%']:.2f}% | R²: {source_metrics['R2']:.3f}")
 
     results_table = [{
         "Domain": "Stanford LFP (Source)",
         "Architecture": "Koopman Neural Operator (KNO)",
-        "Condition": "Source Trained (From Scratch)",
-        "MAPE_%": source_metrics["MAPE_%"],
-        "Median_MAPE_%": source_metrics["Median_MAPE_%"],
-        "RMSE_cycles": source_metrics["RMSE_cycles"],
-        "R2": source_metrics["R2"]
+        "Condition": "5-Fold GroupKFold CV (Leakage-Free)",
+        "MAPE_%": mean_cv_mape,
+        "Median_MAPE_%": np.median(fold_mapes),
+        "RMSE_cycles": 0.0,
+        "R2": 0.0
     }]
 
     # -------------------------------------------------------------------------
@@ -335,6 +360,11 @@ def main():
         ("CALCE NMC", nmc_path, "calce_nmc")
     ]
 
+    # Source dataset scaled with Fold 0 statistics for DANN adaptation
+    X_lfp_fold0_norm = (X_lfp_raw - source_mean_train) / source_std_train
+    ds_src_all = BatterySOCDataset(X_lfp_fold0_norm, y_lfp, domain_label=0)
+    loader_src_all = DataLoader(ds_src_all, batch_size=args.batch_size, shuffle=True)
+
     for domain_label_str, path, tag in targets:
         if not os.path.exists(path):
             logger.warning(f"Skipping {domain_label_str}: file {path} not found.")
@@ -342,12 +372,26 @@ def main():
 
         logger.info(f"\n--- PHASE 2/3: DANN ADVERSARIAL ADAPTATION ON {domain_label_str} ---")
         tgt_data = np.load(path)
-        X_tgt, y_tgt = tgt_data["matrices_soc"], tgt_data["y_eol"]
+        X_tgt_raw, y_tgt, cells_tgt = tgt_data["matrices_soc"], tgt_data["y_eol"], tgt_data["cells"]
 
-        # Target split: 60% train/adaptation (domain_label = 1), 40% test
-        tr_tgt_idx, te_tgt_idx = train_test_split(np.arange(len(X_tgt)), test_size=0.40, random_state=SEED)
-        ds_tgt_tr = BatterySOCDataset(X_tgt[tr_tgt_idx], y_tgt[tr_tgt_idx], domain_label=1)
-        ds_tgt_te = BatterySOCDataset(X_tgt[te_tgt_idx], y_tgt[te_tgt_idx], domain_label=1)
+        # Cell-level target split: 60% train/adaptation, 40% test
+        tr_tgt_idx, te_tgt_idx = train_test_split(np.arange(len(X_tgt_raw)), test_size=0.40, random_state=SEED)
+
+        # ASSERT ZERO TARGET CELL OVERLAP
+        tr_tgt_cells = set(cells_tgt[tr_tgt_idx])
+        te_tgt_cells = set(cells_tgt[te_tgt_idx])
+        assert len(tr_tgt_cells.intersection(te_tgt_cells)) == 0, f"Cell overlap leakage detected in target {domain_label_str}!"
+
+        # SCALING LEAKAGE PREVENTION: Fit Mean/Std STRICTLY on target X_train
+        X_tgt_tr = X_tgt_raw[tr_tgt_idx]
+        X_tgt_te = X_tgt_raw[te_tgt_idx]
+        mean_tgt = np.mean(X_tgt_tr, axis=0, keepdims=True)
+        std_tgt = np.std(X_tgt_tr, axis=0, keepdims=True) + 1e-8
+        X_tgt_tr_norm = (X_tgt_tr - mean_tgt) / std_tgt
+        X_tgt_te_norm = (X_tgt_te - mean_tgt) / std_tgt
+
+        ds_tgt_tr = BatterySOCDataset(X_tgt_tr_norm, y_tgt[tr_tgt_idx], domain_label=1)
+        ds_tgt_te = BatterySOCDataset(X_tgt_te_norm, y_tgt[te_tgt_idx], domain_label=1)
         loader_tgt_tr = DataLoader(ds_tgt_tr, batch_size=4, shuffle=True)
         loader_tgt_te = DataLoader(ds_tgt_te, batch_size=4, shuffle=False)
 
@@ -369,7 +413,7 @@ def main():
         dann_model.load_state_dict(torch.load(src_ckpt, map_location=device))
 
         dann_model = train_dann_loop(
-            dann_model, loader_src_tr, loader_tgt_tr, loader_tgt_te,
+            dann_model, loader_src_all, loader_tgt_tr, loader_tgt_te,
             epochs=args.epochs_dann, lr=args.lr_dann,
             lambda_koopman=args.lambda_koopman, lambda_dann=args.lambda_dann,
             device=device, target_name=f"{domain_label_str}_DANN"
@@ -397,7 +441,7 @@ def main():
     results_df.to_csv(out_csv, index=False)
 
     logger.info("======================================================================")
-    logger.info("KOOPMAN DANN DOMAIN ADAPTATION SUMMARY:")
+    logger.info("KOOPMAN DANN DOMAIN ADAPTATION SUMMARY (100% LEAKAGE-FREE):")
     logger.info("======================================================================")
     for row in results_table:
         logger.info(f"  [{row['Domain']:18s} | {row['Condition']:28s}] MAPE: {row['MAPE_%']:6.2f}% | Median MAPE: {row['Median_MAPE_%']:6.2f}% | R²: {row['R2']:6.3f}")

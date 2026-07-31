@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Multi-Chemistry Data Preprocessing & Patching Module for PatchTST.
+Multi-Chemistry Data Preprocessing & Patching Module for PatchTST (LEAKAGE-FREE).
 Solves the chemistry cross-compatibility challenge by normalizing distinct voltage plateaus
 into a unified Normalized State of Discharge (SOD) grid u in [0.0, 1.0].
-Calculates Savitzky-Golay smoothed dQ/du curves and segments them into local temporal-spatial
-patches suitable for PatchTST Transformer tokenization.
+
+CRITICAL LEAKAGE PREVENTIONS:
+  - Preserves RAW unscaled universal dQ/du matrices.
+  - Zero statistical standardization is applied across the dataset before splitting.
+  - Standard deviation/mean scaling MUST occur dynamically within each Train fold.
 
 Output tensors saved to `data/patchtst_processed/`:
   - stanford_lfp_patches.npz
@@ -63,7 +66,7 @@ def compute_normalized_dqdu(v_raw: np.ndarray, q_raw: np.ndarray, chem: str) -> 
     Computes Savitzky-Golay smoothed dQ/du curve on uniform SOD grid u in [0.0, 1.0].
     """
     if len(v_raw) < 10:
-        return np.zeros(L_GRID)
+        return np.zeros(L_GRID, dtype=np.float32)
 
     u_raw = normalize_voltage_to_sod(v_raw, chem)
 
@@ -77,13 +80,13 @@ def compute_normalized_dqdu(v_raw: np.ndarray, q_raw: np.ndarray, chem: str) -> 
     q_uniq = q_sorted[uniq_idx]
 
     if len(u_uniq) < 5:
-        return np.zeros(L_GRID)
+        return np.zeros(L_GRID, dtype=np.float32)
 
     try:
         f_q = interp1d(u_uniq, q_uniq, kind="linear", bounds_error=False, fill_value="extrapolate")
         q_interp = f_q(SOD_GRID)
     except Exception:
-        return np.zeros(L_GRID)
+        return np.zeros(L_GRID, dtype=np.float32)
 
     # Numerical derivative dQ/du
     dq_du = np.gradient(q_interp, SOD_GRID)
@@ -95,7 +98,7 @@ def compute_normalized_dqdu(v_raw: np.ndarray, q_raw: np.ndarray, chem: str) -> 
     else:
         dq_du_smooth = dq_du
 
-    return dq_du_smooth
+    return dq_du_smooth.astype(np.float32)
 
 
 def patch_sequence(seq: np.ndarray, patch_len: int = PATCH_LEN, stride: int = STRIDE) -> np.ndarray:
@@ -115,14 +118,15 @@ def patch_sequence(seq: np.ndarray, patch_len: int = PATCH_LEN, stride: int = ST
 def preprocess_dataset(df: pd.DataFrame, chem: str, out_path: str):
     """
     Constructs 2D matrices (num_cycles=46, L=200) and PatchTST tensor arrays for a dataset.
+    No global dataset scaling is applied to prevent scaling leakage.
     """
     logger.info(f"Processing {chem} dataset (Rows: {len(df)})...")
     cells = sorted(df["cell_id"].unique())
     N = len(cells)
 
-    matrices_2d = np.zeros((N, len(CYCLES_CNN), L_GRID), dtype=np.float32)
+    matrices_2d_raw = np.zeros((N, len(CYCLES_CNN), L_GRID), dtype=np.float32)
     num_patches = (L_GRID - PATCH_LEN) // STRIDE + 1
-    patches_4d = np.zeros((N, len(CYCLES_CNN), num_patches, PATCH_LEN), dtype=np.float32)
+    patches_4d_raw = np.zeros((N, len(CYCLES_CNN), num_patches, PATCH_LEN), dtype=np.float32)
     y_eol = np.zeros(N, dtype=np.float32)
 
     for idx, cell in enumerate(cells):
@@ -133,7 +137,6 @@ def preprocess_dataset(df: pd.DataFrame, chem: str, out_path: str):
         for c_idx, cyc in enumerate(CYCLES_CNN):
             cyc_df = cell_df[cell_df["cycle_number"] == cyc]
             if len(cyc_df) < 5:
-                # Use zero vector if cycle missing
                 dqdu = np.zeros(L_GRID, dtype=np.float32)
             else:
                 dqdu = compute_normalized_dqdu(
@@ -141,32 +144,25 @@ def preprocess_dataset(df: pd.DataFrame, chem: str, out_path: str):
                     cyc_df["capacity_Ah"].values,
                     chem=chem
                 )
-            matrices_2d[idx, c_idx, :] = dqdu
-            patches_4d[idx, c_idx, :, :] = patch_sequence(dqdu, PATCH_LEN, STRIDE)
+            matrices_2d_raw[idx, c_idx, :] = dqdu
+            patches_4d_raw[idx, c_idx, :, :] = patch_sequence(dqdu, PATCH_LEN, STRIDE)
 
-    # Standardize across dataset to zero mean, unit variance
-    mean_val = np.mean(matrices_2d)
-    std_val = np.std(matrices_2d) + 1e-8
-    matrices_2d_norm = (matrices_2d - mean_val) / std_val
-    patches_4d_norm = (patches_4d - mean_val) / std_val
-
+    # LEAKAGE-FREE ARCHIVING: Save raw unscaled features.
     np.savez_compressed(
         out_path,
-        matrices_2d=matrices_2d_norm,
-        patches_4d=patches_4d_norm,
+        matrices_2d=matrices_2d_raw,
+        patches_4d=patches_4d_raw,
         y_eol=y_eol,
         cells=cells,
         chemistry=chem,
-        sod_grid=SOD_GRID,
-        mean_val=mean_val,
-        std_val=std_val
+        sod_grid=SOD_GRID
     )
-    logger.info(f"Saved {chem} preprocessed patches -> {out_path} (Shape: {patches_4d_norm.shape})")
-    return matrices_2d_norm, patches_4d_norm, y_eol
+    logger.info(f"Saved raw {chem} preprocessed patches -> {out_path} (Shape: {patches_4d_raw.shape})")
+    return matrices_2d_raw, patches_4d_raw, y_eol
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preprocess & Patch Multi-Chemistry Battery Datasets")
+    parser = argparse.ArgumentParser(description="Preprocess & Patch Multi-Chemistry Battery Datasets (Leakage-Free)")
     parser.add_argument("--in-dir", type=str, default="data/patchtst_raw", help="Input raw directory")
     parser.add_argument("--out-dir", type=str, default="data/patchtst_processed", help="Output directory")
     args = parser.parse_args()
@@ -195,7 +191,7 @@ def main():
         preprocess_dataset(df_nmc, "NMC", os.path.join(args.out_dir, "calce_nmc_patches.npz"))
 
     logger.info("======================================================================")
-    logger.info("PATCHTST PREPROCESSING COMPLETED SUCCESSFULLY")
+    logger.info("PATCHTST PREPROCESSING COMPLETED SUCCESSFULLY (ZERO LEAKAGE)")
     logger.info("======================================================================")
 
 
