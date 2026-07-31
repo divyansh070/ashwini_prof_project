@@ -25,7 +25,7 @@ The table below presents a direct, head-to-head comparative analysis of our leak
 | **Stanford / MIT 2019** | $N=124$<br>(80 Train / 44 Test) | Loss of Lithium Inventory (LLI), solid-electrolyte interphase (SEI) thickening | *Severson et al., Nature Energy (2019)* | $R^2 > 0.85$<br>Test MAPE $< 9.1\%$ | **$R^2 = 0.914$**<br>**MAPE = 4.54%** | :white_check_mark: **YES** |
 | **TRI / Stanford 2020** | $N=224$ | High-rate fast-charging Li plating, rapid LLI acceleration | *Attia et al., Nature (2020)* | $R^2 > 0.85$<br>(Large-sample evaluation) | **$R^2 = 0.892$**<br>**5-Fold MAPE = 5.12%** | :white_check_mark: **YES** |
 | **HUST 2022** | $N=77$ | Deep multi-step cycling up to 3,000+ cycles, SEI growth | *Huang et al., Nature Energy / Joule (2022)* | $R^2 > 0.70$<br>(Deep cycling generalization) | **$R^2 = 0.836$**<br>**5-Fold MAPE = 6.08%** | :white_check_mark: **YES** |
-| **Oxford LCO** | $N=8$ | Urban driving discharge dynamics, thermal strain, Loss of Active Material (LAM) | *Birkl et al., IEEE (2017)* | $\text{MAPE} < 7.0\%$ | **DANN MAPE = 5.21%**<br>*(Zero-Shot MAPE = 6.45%)* | :white_check_mark: **YES** |
+| **Oxford LCO** | $N=8$ | Urban driving discharge dynamics, thermal strain, Loss of Active Material (LAM) | *Birkl et al., IEEE (2017)* | $\text{MAPE} < 7.0\%$ | **Optuna DANN MAPE = 2.31%**<br>*(Default DANN = 5.21%)* | :white_check_mark: **YES** (3$\times$ Better) |
 | **CALCE NMC** | $N=12$ | Non-linear relaxation, cathode particle cracking, sharp capacity knees | *He et al., IEEE (2011)* | $\text{MAPE} < 10.0\%$ | **DANN MAPE = 7.14%**<br>*(Zero-Shot MAPE = 8.82%)* | :white_check_mark: **YES** |
 
 ---

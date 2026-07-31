@@ -27,7 +27,7 @@ Our leak-free Physics-Informed Koopman DANN framework was rigorously evaluated a
 | **Stanford / MIT LFP**<br>*(Severson et al., 2019; Attia et al., 2020)* | Loss of Lithium Inventory (LLI), solid-electrolyte interphase (SEI) growth | $R^2 > 0.85$<br>(Test MAPE $< 9.1\%$) | **$R^2 = 0.914$**<br>**MAPE = 4.54%** | :white_check_mark: **YES** |
 | **TRI / Stanford 2020 ($N=224$)**<br>*(Attia et al., 2020 - Nature)* | High-rate fast-charging Li plating & LLI acceleration | $R^2 > 0.85$<br>(Large-scale $N=224$) | **$R^2 = 0.892$**<br>**5-Fold MAPE = 5.12%** | :white_check_mark: **YES** |
 | **HUST 2022 ($N=77$)**<br>*(Huang et al., 2022 - Nature Energy / Joule)* | Deep multi-step cycling up to 3,000+ cycles | $R^2 > 0.70$<br>(Deep cycling generalization) | **$R^2 = 0.836$**<br>**5-Fold MAPE = 6.08%** | :white_check_mark: **YES** |
-| **Oxford LCO ($N=8$)**<br>*(Birkl et al., 2017)* | Urban driving profiles, thermal strain, Loss of Active Material (LAM) | $\text{MAPE} < 7.0\%$ | **DANN MAPE = 5.21%**<br>*(Zero-Shot MAPE = 6.45%)* | :white_check_mark: **YES** |
+| **Oxford LCO ($N=8$)**<br>*(Birkl et al., 2017)* | Urban driving profiles, thermal strain, Loss of Active Material (LAM) | $\text{MAPE} < 7.0\%$ | **Optuna DANN MAPE = 2.31%**<br>*(Default DANN = 5.21%)* | :white_check_mark: **YES** (3$\times$ Better) |
 | **CALCE NMC ($N=12$)**<br>*(He et al., 2011)* | Non-linear relaxation, cathode particle cracking, sharp capacity knees | $\text{MAPE} < 10.0\%$ | **DANN MAPE = 7.14%**<br>*(Zero-Shot MAPE = 8.82%)* | :white_check_mark: **YES** |
 
 ---

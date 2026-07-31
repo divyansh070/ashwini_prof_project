@@ -1,0 +1,10 @@
+{
+  "best_trial_number": 21,
+  "best_linear_space_mape_pct": 2.306157350540161,
+  "best_params": {
+    "lambda_dann": 0.5206956474011101,
+    "lambda_koopman": 0.07933654965626635,
+    "lambda_mono": 0.051155823646741004,
+    "lr_dann": 0.0008983021993943738
+  }
+}

@@ -1,6 +1,6 @@
-Domain,Architecture,Condition,MAPE_%,Median_MAPE_%,RMSE_cycles,R2
-Stanford LFP (Source),Koopman Neural Operator (KNO),Source Trained (From Scratch),2.0124631002545357,1.7182066,36.37627689178502,0.9727577567100525
-Oxford LCO,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),6.137241423130035,6.1837797,38.54781394529316,0.9400038719177246
-Oxford LCO,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,2.625024877488613,2.179963,21.864301234135777,0.9806983470916748
-CALCE NMC,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),20.211584866046906,19.792522,169.92214439633818,-0.09344601631164551
-CALCE NMC,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,12.624597549438477,11.607206,104.04569590299015,0.5900360941886902
+Domain,Architecture,Condition,Evaluation_Space,MAPE_%,Median_MAPE_%,RMSE_cycles,R2
+Stanford LFP (Source),Koopman Neural Operator (KNO),5-Fold GroupKFold CV (Leakage-Free),Linear (Cycles),5.003937520086765,3.6426888,42.77666998219912,0.9631647586822509
+Oxford LCO,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),Linear (Cycles),29.991215467453003,30.511108,190.25497899200957,-0.4614858627319336
+Oxford LCO,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,Linear (Cycles),20.340320467948914,19.645988,133.53683363589238,0.28001290559768677
+CALCE NMC,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),Linear (Cycles),15.229205787181854,9.466293,121.3066475275572,0.4427301287651062
+CALCE NMC,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,Linear (Cycles),12.609060108661652,11.43843,105.36287741657401,0.5795913934707642
