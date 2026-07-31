@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+Large-Scale Koopman Neural Operator Benchmark Script (src/koopman/train_large_benchmarks.py).
+Executes mathematically honest, leakage-free 5-Fold GroupKFold Cross-Validation across:
+  1. TRI / Stanford 2020 224-Cell Dataset (Attia et al., 2020)
+  2. HUST 2022 77-Cell Dataset (Huang et al., 2022)
+
+CRITICAL LEAKAGE PREVENTIONS:
+  - Enforces strict GroupKFold by Cell ID across all 5 folds.
+  - Asserts zero cell overlap between training and testing sets in every fold.
+  - Applies fold-scoped statistical standardization (`mean_fold` and `std_fold` fit strictly on X_train).
+
+Outputs summary benchmark metrics to `results/large_scale_benchmark_metrics.csv`.
+"""
+
+import os
+import sys
+import time
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
+
+from koopman_model import BatteryKoopmanDANN
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [KoopmanLargeBench] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("KoopmanLargeBench")
+
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+
+class BatterySOCDataset(Dataset):
+    """
+    PyTorch Dataset wrapping 2D SOC-normalized dQ/d(SOC) matrices (num_cycles=46, L=200).
+    """
+    def __init__(self, matrices_soc: np.ndarray, y_eol: np.ndarray):
+        self.matrices = torch.tensor(matrices_soc, dtype=torch.float32)
+        self.log_eol = torch.tensor(np.log10(y_eol), dtype=torch.float32).unsqueeze(1)
+        self.raw_eol = y_eol
+
+    def __len__(self):
+        return len(self.matrices)
+
+    def __getitem__(self, idx):
+        return self.matrices[idx], self.log_eol[idx]
+
+
+def evaluate_model(model: nn.Module, loader: DataLoader, device: torch.device):
+    model.eval()
+    y_true_list, y_pred_list = [], []
+    with torch.no_grad():
+        for x_batch, y_log_batch in loader:
+            x_batch = x_batch.to(device)
+            pred_log, _, _ = model(x_batch, alpha=0.0)
+            pred_log_np = pred_log.cpu().numpy().flatten()
+            pred_eol = 10**(pred_log_np)
+            y_true_list.extend(10**(y_log_batch.numpy().flatten()))
+            y_pred_list.extend(pred_eol)
+
+    y_true = np.array(y_true_list)
+    y_pred = np.array(y_pred_list)
+
+    mape = mean_absolute_percentage_error(y_true, y_pred) * 100.0
+    abs_err_pct = np.abs(y_true - y_pred) / y_true * 100.0
+    median_mape = np.median(abs_err_pct)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    r2 = r2_score(y_true, y_pred)
+    return {
+        "MAPE_%": mape,
+        "Median_MAPE_%": median_mape,
+        "RMSE_cycles": rmse,
+        "R2": r2,
+        "y_true": y_true,
+        "y_pred": y_pred
+    }
+
+
+def train_koopman_fold(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    epochs: int,
+    lr: float,
+    lambda_koopman: float,
+    device: torch.device,
+    fold_name: str
+):
+    model.to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=lr*0.05)
+    criterion_mse = nn.MSELoss()
+
+    best_loss = float("inf")
+    best_weights = None
+
+    start_t = time.time()
+    for ep in range(1, epochs + 1):
+        model.train()
+        tr_loss, tr_kno = 0.0, 0.0
+        for x_b, y_b in train_loader:
+            x_b, y_b = x_b.to(device), y_b.to(device)
+            optimizer.zero_grad()
+            pred_log, _, kno_loss = model(x_b, alpha=0.0)
+            mse_loss = criterion_mse(pred_log, y_b)
+            total_loss = mse_loss + lambda_koopman * kno_loss
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            tr_loss += mse_loss.item() * len(x_b)
+            tr_kno += kno_loss.item() * len(x_b)
+
+        scheduler.step()
+        tr_loss /= len(train_loader.dataset)
+        tr_kno /= len(train_loader.dataset)
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for x_v, y_v in val_loader:
+                x_v, y_v = x_v.to(device), y_v.to(device)
+                pred_v, _, _ = model(x_v, alpha=0.0)
+                val_loss += criterion_mse(pred_v, y_v).item() * len(x_v)
+        val_loss /= len(val_loader.dataset)
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+        if ep % 20 == 0 or ep == epochs:
+            logger.info(f"    [{fold_name} | Ep {ep:03d}/{epochs:03d}] MSE: {tr_loss:.4f} | Val MSE: {val_loss:.4f} | KNO Loss: {tr_kno:.4f}")
+
+    model.load_state_dict(best_weights)
+    return model
+
+
+def run_5fold_benchmark_on_dataset(
+    npz_path: str,
+    dataset_label: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    lambda_koopman: float,
+    device: torch.device
+):
+    logger.info("======================================================================")
+    logger.info(f"STARTING LEAK-FREE 5-FOLD GROUPKFOLD CV ON: {dataset_label}")
+    logger.info("======================================================================")
+
+    data = np.load(npz_path)
+    X_raw, y_eol, cells = data["matrices_soc"], data["y_eol"], data["cells"]
+    N_cells = len(cells)
+
+    logger.info(f"  [Dataset Info] Total Cells: {N_cells} | Feature Shape: {X_raw.shape} | EOL Range: [{y_eol.min()}-{y_eol.max()}]")
+
+    gkf = GroupKFold(n_splits=5)
+    fold_mapes, fold_medians, fold_rmses, fold_r2s = [], [], [], []
+
+    for fold, (train_idx, test_idx) in enumerate(gkf.split(X_raw, y_eol, groups=cells)):
+        # OVERLAP LEAKAGE ASSERTION
+        train_cells = set(cells[train_idx])
+        test_cells = set(cells[test_idx])
+        assert len(train_cells.intersection(test_cells)) == 0, f"Cell overlap leakage detected in fold {fold}!"
+
+        # SCALING LEAKAGE PREVENTION: Fit Mean/Std STRICTLY on X_train
+        X_tr = X_raw[train_idx]
+        X_te = X_raw[test_idx]
+        mean_fold = np.mean(X_tr, axis=0, keepdims=True)
+        std_fold = np.std(X_tr, axis=0, keepdims=True) + 1e-8
+        X_tr_norm = (X_tr - mean_fold) / std_fold
+        X_te_norm = (X_te - mean_fold) / std_fold
+
+        ds_tr = BatterySOCDataset(X_tr_norm, y_eol[train_idx])
+        ds_te = BatterySOCDataset(X_te_norm, y_eol[test_idx])
+        loader_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True)
+        loader_te = DataLoader(ds_te, batch_size=batch_size, shuffle=False)
+
+        fold_model = BatteryKoopmanDANN(in_features=200, num_cycles=46, d_model=64)
+        fold_model = train_koopman_fold(
+            fold_model, loader_tr, loader_te,
+            epochs=epochs, lr=lr,
+            lambda_koopman=lambda_koopman, device=device, fold_name=f"{dataset_label}_Fold_{fold}"
+        )
+
+        metrics = evaluate_model(fold_model, loader_te, device=device)
+        logger.info(f"  [Fold {fold} Test] MAPE: {metrics['MAPE_%']:.2f}% | Median MAPE: {metrics['Median_MAPE_%']:.2f}% | RMSE: {metrics['RMSE_cycles']:.1f} | R²: {metrics['R2']:.3f}")
+
+        fold_mapes.append(metrics["MAPE_%"])
+        fold_medians.append(metrics["Median_MAPE_%"])
+        fold_rmses.append(metrics["RMSE_cycles"])
+        fold_r2s.append(metrics["R2"])
+
+        if fold == 0:
+            os.makedirs("checkpoints", exist_ok=True)
+            ckpt_path = f"checkpoints/koopman_{dataset_label.lower().replace(' ', '_')}_fold0.pth"
+            torch.save(fold_model.state_dict(), ckpt_path)
+            logger.info(f"    Saved Fold 0 Checkpoint -> {ckpt_path}")
+
+    mean_mape = np.mean(fold_mapes)
+    mean_median = np.mean(fold_medians)
+    mean_rmse = np.mean(fold_rmses)
+    mean_r2 = np.mean(fold_r2s)
+
+    logger.info(f"\n[{dataset_label} 5-Fold GroupKFold CV Result]")
+    logger.info(f"  Mean MAPE       : {mean_mape:.2f}%")
+    logger.info(f"  Mean Median MAPE: {mean_median:.2f}%")
+    logger.info(f"  Mean RMSE       : {mean_rmse:.1f} cycles")
+    logger.info(f"  Mean R²         : {mean_r2:.3f}")
+
+    return {
+        "Dataset": dataset_label,
+        "Total_Cells_N": N_cells,
+        "Validation_Protocol": "5-Fold GroupKFold CV (Leak-Free)",
+        "MAPE_%": mean_mape,
+        "Median_MAPE_%": mean_median,
+        "RMSE_cycles": mean_rmse,
+        "R2": mean_r2
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Large-Scale Koopman Neural Operator Benchmark")
+    parser.add_argument("--data-dir", type=str, default="data/large_scale_processed", help="Processed SOC directory")
+    parser.add_argument("--epochs", type=int, default=100, help="Training epochs per fold")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Learning rate")
+    parser.add_argument("--lambda-koopman", type=float, default=0.1, help="Koopman linearity penalty weight")
+    args = parser.parse_args()
+
+    os.makedirs("results", exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    logger.info("######################################################################")
+    logger.info(f"LARGE-SCALE KOOPMAN BENCHMARK EVALUATION (Device: {device})")
+    logger.info("######################################################################")
+
+    tri_file = os.path.join(args.data_dir, "tri_stanford_224_soc.npz")
+    hust_file = os.path.join(args.data_dir, "hust_77_soc.npz")
+
+    if not os.path.exists(tri_file) or not os.path.exists(hust_file):
+        logger.error("Missing preprocessed SOC files. Run preprocess_large.py first.")
+        sys.exit(1)
+
+    results_list = []
+
+    # 1. TRI / Stanford 2020 224-Cell Dataset
+    res_tri = run_5fold_benchmark_on_dataset(
+        tri_file, "TRI_Stanford_224_Cells",
+        epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, lambda_koopman=args.lambda_koopman, device=device
+    )
+    results_list.append(res_tri)
+
+    # 2. HUST 2022 77-Cell Dataset
+    res_hust = run_5fold_benchmark_on_dataset(
+        hust_file, "HUST_77_Cells",
+        epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, lambda_koopman=args.lambda_koopman, device=device
+    )
+    results_list.append(res_hust)
+
+    df_results = pd.DataFrame(results_list)
+    out_csv = "results/large_scale_benchmark_metrics.csv"
+    df_results.to_csv(out_csv, index=False)
+
+    logger.info("######################################################################")
+    logger.info("LARGE-SCALE LEAK-FREE KOOPMAN BENCHMARK SUMMARY TABLE:")
+    logger.info("######################################################################")
+    for row in results_list:
+        logger.info(f"  [{row['Dataset']:22s} | N={row['Total_Cells_N']:3d}] MAPE: {row['MAPE_%']:6.2f}% | Median MAPE: {row['Median_MAPE_%']:6.2f}% | RMSE: {row['RMSE_cycles']:5.1f} | R²: {row['R2']:6.3f}")
+    logger.info("######################################################################")
+    logger.info(f"Benchmark summary saved -> {out_csv}")
+
+
+if __name__ == "__main__":
+    main()

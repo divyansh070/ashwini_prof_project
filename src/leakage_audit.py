@@ -83,8 +83,8 @@ def check_scaling_leakage():
 
     leakage_found = False
 
-    # Inspect preprocess_v2.py and preprocess.py
-    for script_name in ["src/koopman/preprocess_v2.py", "src/patchtst/preprocess.py"]:
+    # Inspect preprocess_v2.py, preprocess.py, and preprocess_large.py
+    for script_name in ["src/koopman/preprocess_v2.py", "src/patchtst/preprocess.py", "src/koopman/preprocess_large.py"]:
         if os.path.exists(script_name):
             with open(script_name, "r") as f:
                 content = f.read()
@@ -115,7 +115,7 @@ def check_overlap_leakage():
 
     leakage_found = False
 
-    for script_name in ["src/koopman/train_da_colab.py", "src/patchtst/train_colab.py"]:
+    for script_name in ["src/koopman/train_da_colab.py", "src/patchtst/train_colab.py", "src/koopman/train_large_benchmarks.py"]:
         if os.path.exists(script_name):
             with open(script_name, "r") as f:
                 content = f.read()
