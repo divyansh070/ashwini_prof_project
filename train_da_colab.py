@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Top-level wrapper for Domain Adversarial Transfer Learning (train_da_colab.py).
+Top-level wrapper for Domain Adversarial Transfer Learning Script.
 Executes src/koopman/train_da_colab.py
 """
 import sys

@@ -1,0 +1,6 @@
+Domain,Architecture,Condition,MAPE_%,Median_MAPE_%,RMSE_cycles,R2
+Stanford LFP (Source),Koopman Neural Operator (KNO),Source Trained (From Scratch),2.0124631002545357,1.7182066,36.37627689178502,0.9727577567100525
+Oxford LCO,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),6.137241423130035,6.1837797,38.54781394529316,0.9400038719177246
+Oxford LCO,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,2.625024877488613,2.179963,21.864301234135777,0.9806983470916748
+CALCE NMC,Koopman Neural Operator (KNO),Zero-Shot (No Adaptation),20.211584866046906,19.792522,169.92214439633818,-0.09344601631164551
+CALCE NMC,Koopman DANN (Explicit Adaptation),Domain-Adversarially Aligned,12.624597549438477,11.607206,104.04569590299015,0.5900360941886902

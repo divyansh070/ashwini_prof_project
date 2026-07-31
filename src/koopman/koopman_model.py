@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Physics-Informed Koopman Neural Operator (KNO) with Self-Attention & Domain Adversarial Adaptation.
+Physics-Informed Koopman Neural Operator & Domain-Adversarial Architecture (src/koopman/koopman_model.py).
 Implements:
-  1. KoopmanEncoder: Maps non-linear dQ/d(SOC) curves into a linear invariant latent subspace.
-  2. KoopmanOperatorLayer: Learns transition matrix K in R^(D x D) enforcing z_{k+1} = K z_k
-     and computes Physics-Informed Koopman Linearity Loss L_KNO.
-  3. SelfAttentionModule: Multi-head temporal attention across Koopman trajectory embeddings.
-  4. GradientReversalLayer (GRL) & DomainDiscriminator: Explicit Domain-Adversarial Neural Network (DANN)
-     adaptation head to align Stanford LFP (Source) and Oxford LCO / CALCE NMC (Target) latent distributions.
-  5. RULRegressionHead: Predicts log10(Cycle Life) from Koopman-attended representations.
+  1. KoopmanEncoder: Maps 2D SOC-normalized dQ/d(SOC) curves (num_cycles=46, L=200) into a linear-latent space Z.
+  2. KoopmanOperatorLayer: Learns transition matrix K in R^{D x D} such that z_{k+1} = K z_k,
+     penalized by a Physics-Informed Linearity Loss (L_KNO) and a Thermodynamic Monotonicity Loss (L_mono)
+     to prevent unphysical capacity rebound across cycle progression.
+  3. DomainDiscriminator: A Gradient Reversal Layer (GRL) classifier for Domain-Adversarial
+     Neural Network (DANN) transfer learning across battery chemistries (LFP, LCO, NMC).
+  4. Multi-Task Prediction Head: Simultaneously estimates Remaining Useful Life (EOL) and
+     Knee Onset Cycle (C_knee).
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Function
-import numpy as np
 
 
 class GradientReversalFunction(Function):
     """
-    Gradient Reversal Layer (GRL) for explicit Domain Adversarial Adaptation (DANN).
-    Forward: identity transformation.
-    Backward: multiplies incoming gradients by -alpha.
+    Gradient Reversal Layer (GRL) from Ganin et al. (2016).
+    Forward pass is an identity mapping; backward pass scales and reverses the gradient by -alpha.
     """
     @staticmethod
     def forward(ctx, x, alpha):
@@ -34,164 +34,143 @@ class GradientReversalFunction(Function):
         return output, None
 
 
-def grad_reverse(x: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-    return GradientReversalFunction.apply(x, alpha)
-
-
 class KoopmanEncoder(nn.Module):
     """
-    Maps 1D SOC curves (L=200) into a D-dimensional Koopman latent embedding space.
+    1D-CNN + Self-Attention feature extractor mapping 200-pt SOC-normalized dQ/d(SOC)
+    vectors across early cycles into a D-dimensional Koopman latent embedding.
     """
     def __init__(self, in_features: int = 200, d_model: int = 64):
-        super(KoopmanEncoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Linear(in_features, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Linear(128, d_model),
-            nn.LayerNorm(d_model)
-        )
+        super().__init__()
+        self.conv1 = nn.Conv1d(1, 32, kernel_size=7, stride=2, padding=3)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.conv2 = nn.Conv1d(32, d_model, kernel_size=5, stride=2, padding=2)
+        self.bn2 = nn.BatchNorm1d(d_model)
+        
+        self.proj = nn.Linear(d_model * (in_features // 4), d_model)
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+        self.attn = nn.MultiheadAttention(embed_dim=d_model, num_heads=4, batch_first=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch_size, num_cycles, in_features)
-        return self.encoder(x)
+        B, T, L = x.shape
+        x_flat = x.view(B * T, 1, L)
+        
+        h = F.relu(self.bn1(self.conv1(x_flat)))
+        h = F.relu(self.bn2(self.conv2(h)))
+        h = h.view(B * T, -1)
+        z = F.gelu(self.proj(h))
+        z = self.layer_norm(z).view(B, T, -1)
+        
+        # Self-attention over temporal cycle dimension
+        z_attn, _ = self.attn(z, z, z)
+        return z_attn
 
 
 class KoopmanOperatorLayer(nn.Module):
     """
-    Learns linear Koopman operator matrix K in R^(D x D) such that z_{k+1} = K z_k.
-    Calculates the Physics-Informed Koopman Linearity Loss.
+    Learns an invariant linear transition matrix K in R^{D x D} such that:
+       z_{k+1} = K z_k
+    Computes two physics-informed regularizers:
+       1. Linearity Loss (L_KNO): || z_{k+1} - K z_k ||_2^2
+       2. Monotonicity Loss (L_mono): Penalizes positive increments in latent trajectory norm
+          to enforce thermodynamic non-rebounding capacity fade.
     """
     def __init__(self, d_model: int = 64):
-        super(KoopmanOperatorLayer, self).__init__()
-        # Learnable transition matrix initialized close to identity
-        self.K = nn.Parameter(torch.eye(d_model) + torch.randn(d_model, d_model) * 0.01)
+        super().__init__()
+        self.K = nn.Parameter(torch.eye(d_model) + 0.01 * torch.randn(d_model, d_model))
 
     def forward(self, z_seq: torch.Tensor):
-        """
-        z_seq shape: (batch_size, num_cycles, d_model)
-        returns    : koompan_loss scalar, evolved_z tensor
-        """
-        batch_size, num_cycles, d_model = z_seq.size()
-        if num_cycles < 2:
-            return torch.tensor(0.0, device=z_seq.device), z_seq
-
-        z_current = z_seq[:, :-1, :]  # (batch_size, T-1, D)
-        z_next_true = z_seq[:, 1:, :] # (batch_size, T-1, D)
-
-        # Apply Koopman transition matrix K: z_{k+1}_pred = z_k K^T
-        z_next_pred = torch.matmul(z_current, self.K.t())
-
-        # Physics-Informed Koopman Linearity Loss
-        koopman_loss = torch.mean((z_next_true - z_next_pred) ** 2)
-
-        return koopman_loss, z_next_pred
-
-
-class SelfAttentionModule(nn.Module):
-    """
-    Multi-Head Temporal Self-Attention across Koopman trajectory embeddings.
-    """
-    def __init__(self, d_model: int = 64, nhead: int = 4, dropout: float = 0.1):
-        super(SelfAttentionModule, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, dropout=dropout, batch_first=True)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, z_seq: torch.Tensor) -> torch.Tensor:
-        # z_seq shape: (batch_size, num_cycles, d_model)
-        attn_out, _ = self.attention(z_seq, z_seq, z_seq)
-        out = self.norm(z_seq + self.dropout(attn_out))
-        return out
+        # z_seq shape: (B, T, D)
+        B, T, D = z_seq.shape
+        
+        z_curr = z_seq[:, :-1, :]  # (B, T-1, D)
+        z_next = z_seq[:, 1:, :]   # (B, T-1, D)
+        
+        # Linear Koopman evolution prediction: z_{k+1}^{pred} = z_k K^T
+        z_pred_next = torch.matmul(z_curr, self.K.t())
+        
+        # 1. Koopman Linearity Loss (L_KNO)
+        kno_loss = F.mse_loss(z_pred_next, z_next)
+        
+        # 2. Thermodynamic Monotonicity Loss (L_mono)
+        # In an irreversible degradation process, latent state magnitude should monotonically decay
+        # Any unphysical positive jump in ||z_{k+1}|| - ||z_k|| is penalized
+        norm_curr = torch.norm(z_curr, p=2, dim=-1)
+        norm_next = torch.norm(z_next, p=2, dim=-1)
+        mono_violation = F.relu(norm_next - norm_curr)
+        mono_loss = torch.mean(mono_violation ** 2)
+        
+        return kno_loss, mono_loss
 
 
 class DomainDiscriminator(nn.Module):
     """
-    Domain adversarial classification head predicting source (0) vs. target (1) domain.
+    Gradient Reversal Layer (GRL) Domain Discriminator for DANN adversarial training.
     """
     def __init__(self, d_model: int = 64):
-        super(DomainDiscriminator, self).__init__()
-        self.classifier = nn.Sequential(
+        super().__init__()
+        self.net = nn.Sequential(
             nn.Linear(d_model, 32),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(32, 2)
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 2)  # Binary classification: 0=Source (LFP), 1=Target (LCO/NMC)
         )
 
-    def forward(self, z: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
-        # Apply Gradient Reversal Layer (GRL)
-        z_rev = grad_reverse(z, alpha=alpha)
-        logits = self.classifier(z_rev)
-        return logits
+    def forward(self, x: torch.Tensor, alpha: float) -> torch.Tensor:
+        feat_rev = GradientReversalFunction.apply(x, alpha)
+        return self.net(feat_rev)
 
 
 class BatteryKoopmanDANN(nn.Module):
     """
-    Full Physics-Informed Koopman Neural Operator + Self-Attention + DANN Model.
+    Complete Multi-Task Physics-Informed Koopman Neural Operator & DANN Architecture.
+    Simultaneously outputs:
+      1. pred_log_eol: Log10 predicted End-of-Life (remaining cycle life).
+      2. pred_log_knee: Log10 predicted Knee Onset Cycle (C_knee).
+      3. domain_logits: Source vs. Target domain discriminator logits.
+      4. kno_loss: Koopman linearity regularizer.
+      5. mono_loss: Thermodynamic monotonicity regularizer.
     """
-    def __init__(
-        self,
-        in_features: int = 200,    # SOC grid points
-        num_cycles: int = 46,      # Early cycles
-        d_model: int = 64,
-        nhead: int = 4,
-        dropout: float = 0.1
-    ):
-        super(BatteryKoopmanDANN, self).__init__()
-        self.num_cycles = num_cycles
-        self.d_model = d_model
-
+    def __init__(self, in_features: int = 200, num_cycles: int = 46, d_model: int = 64):
+        super().__init__()
         self.encoder = KoopmanEncoder(in_features=in_features, d_model=d_model)
-        self.koopman_layer = KoopmanOperatorLayer(d_model=d_model)
-        self.attention = SelfAttentionModule(d_model=d_model, nhead=nhead, dropout=dropout)
-
-        # RUL Regression Head
-        self.regression_head = nn.Sequential(
-            nn.Linear(d_model, 32),
-            nn.LayerNorm(32),
+        self.koopman = KoopmanOperatorLayer(d_model=d_model)
+        self.domain_classifier = DomainDiscriminator(d_model=d_model)
+        
+        # Shared pooling and feature bottleneck
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.shared_fc = nn.Sequential(
+            nn.Linear(d_model, 64),
+            nn.LayerNorm(64),
             nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(32, 1)
+            nn.Dropout(0.15)
         )
+        
+        # Primary Task Head: Log10 EOL prediction
+        self.fc_eol = nn.Linear(64, 1)
+        
+        # Auxiliary Task Head: Log10 Knee Onset Cycle (C_knee) prediction
+        self.fc_knee = nn.Linear(64, 1)
 
-        # Domain Discriminator (DANN)
-        self.domain_discriminator = DomainDiscriminator(d_model=d_model)
-
-    def extract_features(self, x: torch.Tensor):
-        """
-        Extracts Koopman-attended global embedding (pooled across cycles).
-        """
-        z_seq = self.encoder(x)                            # (batch_size, num_cycles, d_model)
-        koopman_loss, _ = self.koopman_layer(z_seq)        # Scalar loss
-        z_attn = self.attention(z_seq)                     # (batch_size, num_cycles, d_model)
-        z_global = torch.mean(z_attn, dim=1)               # (batch_size, d_model)
-        return z_global, koopman_loss
-
-    def forward(self, x: torch.Tensor, alpha: float = 1.0):
-        """
-        Input x shape : (batch_size, num_cycles=46, in_features=200)
-        Returns:
-          1. log_eol_pred  : predicted log10(Cycle Life) shape (batch_size, 1)
-          2. domain_logits : DANN domain classification logits shape (batch_size, 2)
-          3. koopman_loss  : scalar Physics-Informed linearity loss
-        """
-        z_global, koopman_loss = self.extract_features(x)
-
-        # 1. RUL Prediction
-        log_eol_pred = self.regression_head(z_global)
-
-        # 2. Domain Discriminator (via GRL)
-        domain_logits = self.domain_discriminator(z_global, alpha=alpha)
-
-        return log_eol_pred, domain_logits, koopman_loss
-
-
-if __name__ == "__main__":
-    # Test Koopman DANN shape consistency
-    model = BatteryKoopmanDANN(in_features=200, num_cycles=46, d_model=64)
-    dummy_input = torch.randn(8, 46, 200)
-    pred_log, dom_logits, kno_loss = model(dummy_input, alpha=0.5)
-    print(f"Koopman DANN test forward successful!")
-    print(f"  RUL Pred shape   : {pred_log.shape}")
-    print(f"  Domain Logits    : {dom_logits.shape}")
-    print(f"  KNO Linearity Loss: {kno_loss.item():.4f}")
+    def forward(self, x: torch.Tensor, alpha: float = 0.0):
+        # x: (B, T, L)
+        z_seq = self.encoder(x)  # (B, T, D)
+        
+        # Compute Koopman Physics-Informed losses
+        kno_loss, mono_loss = self.koopman(z_seq)
+        
+        # Temporal pooling over early cycles
+        z_pool = z_seq.transpose(1, 2)  # (B, D, T)
+        z_global = self.pool(z_pool).squeeze(-1)  # (B, D)
+        
+        feat = self.shared_fc(z_global)
+        
+        # Multi-task predictions
+        pred_log_eol = self.fc_eol(feat)
+        pred_log_knee = self.fc_knee(feat)
+        
+        # Domain Adversarial Discriminator logits
+        domain_logits = self.domain_classifier(z_global, alpha=alpha)
+        
+        return pred_log_eol, pred_log_knee, domain_logits, kno_loss, mono_loss
