@@ -37,3 +37,4 @@ models /
 *.parquet
 *.npz
 *.pth
+test_hf.py
