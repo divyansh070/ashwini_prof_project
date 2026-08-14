@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+REAL DATA ACQUISITION SCRIPT
+Downloads and parses ONLY genuine, physical battery datasets.
+NO synthetic np.linspace fallbacks. If the download fails, the script FAILS.
+
+Datasets:
+  1. Stanford/MIT LFP (Severson 2019) - 124 cells from HuggingFace mirror
+  2. NASA Ames LCO (Saha & Goebel 2007) - 4 cells from Kaggle mirror
+"""
+
+import os
+import sys
+import logging
+import argparse
+import numpy as np
+import pandas as pd
+import urllib.request
+import zipfile
+import glob
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [RealDataAcq] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("RealDataAcq")
+
+SEED = 42
+np.random.seed(SEED)
+
+# --- BAD CELLS from Severson et al. 2019 ---
+BAD_CELLS = {
+    "b1c8", "b1c10", "b1c12", "b1c13", "b1c22",
+    "b2c7", "b2c8", "b2c9", "b2c15", "b2c16",
+    "b3c2", "b3c23", "b3c32", "b3c37", "b3c42", "b3c43"
+}
+
+
+def get_severson_valid_cells():
+    """Returns the 124 valid cell IDs from Severson et al. (2019)."""
+    cells = []
+    for i in range(46):
+        cid = f"b1c{i}"
+        if cid not in BAD_CELLS:
+            cells.append(cid)
+    for i in range(48):
+        cid = f"b2c{i}"
+        if cid not in BAD_CELLS:
+            cells.append(cid)
+    for i in [0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+              21, 22, 24, 25, 26, 27, 28, 29, 30, 31, 33, 34, 35, 36, 38, 39, 40, 41, 44, 45]:
+        cid = f"b3c{i}"
+        if cid not in BAD_CELLS:
+            cells.append(cid)
+    return cells
+
+
+# ============================================================
+# DATASET 1: Stanford/MIT LFP (Severson et al. 2019) - 124 cells
+# Source: HuggingFace mirror of the original MATR.io dataset
+# Chemistry: LiFePO4 (LFP), Voltage range: [2.0V, 3.6V]
+# ============================================================
+
+SEVERSON_BASE_URL = "https://huggingface.co/datasets/bsebench-org/severson-2019/resolve/main/{cell_id}.parquet"
+
+
+def download_stanford_lfp(raw_dir: str, proc_dir: str):
+    """
+    Downloads real Stanford/MIT LFP cells from HuggingFace.
+    Returns standardized parquet with columns:
+      cell_id, chemistry, cycle_number, voltage_V, capacity_Ah, current_A, cycle_life
+    """
+    logger.info("=" * 70)
+    logger.info("DOWNLOADING REAL STANFORD/MIT LFP DATASET (Severson et al. 2019)")
+    logger.info("=" * 70)
+
+    cells = get_severson_valid_cells()
+    os.makedirs(raw_dir, exist_ok=True)
+
+    # Download raw parquet files
+    for i, cell_id in enumerate(cells):
+        target_path = os.path.join(raw_dir, f"{cell_id}.parquet")
+        if os.path.exists(target_path) and os.path.getsize(target_path) > 1000:
+            continue  # Already cached
+
+        url = SEVERSON_BASE_URL.format(cell_id=cell_id)
+        logger.info(f"[{i + 1}/{len(cells)}] Downloading {cell_id}...")
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+                with open(target_path, "wb") as f:
+                    f.write(data)
+        except Exception as e:
+            logger.error(f"FATAL: Failed to download {cell_id}: {e}")
+            raise RuntimeError(f"Cannot download real data for {cell_id}. Aborting — NO SYNTHETIC FALLBACK.")
+
+    # Process: compute cycle_life and extract early cycles
+    logger.info("Processing real LFP discharge curves...")
+    all_records = []
+
+    for cell_id in cells:
+        fpath = os.path.join(raw_dir, f"{cell_id}.parquet")
+        df = pd.read_parquet(fpath)
+        df["cycle_number"] = df["cycle_number"].astype(int)
+        df = df.dropna(subset=["voltage_V", "current_A", "capacity_Ah"])
+
+        # Compute real cycle_life from capacity fade
+        cycle_caps = df.groupby("cycle_number")["capacity_Ah"].max()
+        c0 = float(cycle_caps.iloc[0])
+        threshold = min(0.88, 0.8 * c0)
+        below = cycle_caps[cycle_caps < threshold]
+        cycle_life = int(below.index[0]) if len(below) > 0 else int(cycle_caps.index[-1])
+
+        # Extract only discharge data from early cycles (10 to 100, step 2)
+        for cyc in range(10, 101, 2):
+            cyc_df = df[(df["cycle_number"] == cyc) & (df["current_A"] < -0.01)]
+            if len(cyc_df) < 5:
+                continue
+            cyc_df = cyc_df.sort_values("time_s")
+            for _, row in cyc_df.iterrows():
+                all_records.append({
+                    "cell_id": cell_id,
+                    "chemistry": "LFP",
+                    "cycle_number": cyc,
+                    "voltage_V": float(row["voltage_V"]),
+                    "capacity_Ah": float(row["capacity_Ah"]),
+                    "current_A": float(row["current_A"]),
+                    "cycle_life": cycle_life
+                })
+
+    result_df = pd.DataFrame(all_records)
+    out_path = os.path.join(proc_dir, "stanford_lfp.parquet")
+    result_df.to_parquet(out_path, index=False)
+
+    n_cells = result_df["cell_id"].nunique()
+    cl = result_df.groupby("cell_id")["cycle_life"].first()
+    logger.info(f"✅ REAL Stanford LFP: {n_cells} cells | {len(result_df)} rows | EOL range: [{cl.min()}, {cl.max()}]")
+    logger.info(f"   Saved to: {out_path}")
+    return result_df
+
+
+# ============================================================
+# DATASET 2: NASA Ames Battery (Saha & Goebel 2007) - 4 cells
+# Source: NASA PHM S3 bucket (official)
+# Chemistry: LiCoO2 (LCO), 18650 format
+# Cells: B0005, B0006, B0007, B0018
+# ============================================================
+
+NASA_URL = "https://phm-datasets.s3.amazonaws.com/NASA/5.+Battery+Data+Set.zip"
+
+
+def download_nasa_lco(raw_dir: str, proc_dir: str):
+    """
+    Downloads real NASA Ames LCO battery dataset.
+    Parses .mat files using scipy.io.loadmat.
+    Returns standardized parquet.
+    """
+    logger.info("=" * 70)
+    logger.info("DOWNLOADING REAL NASA AMES LCO DATASET (Saha & Goebel 2007)")
+    logger.info("=" * 70)
+
+    os.makedirs(raw_dir, exist_ok=True)
+    zip_path = os.path.join(raw_dir, "nasa_battery.zip")
+
+    # Download
+    if not os.path.exists(zip_path) or os.path.getsize(zip_path) < 1000000:
+        logger.info(f"Downloading from {NASA_URL}...")
+        try:
+            req = urllib.request.Request(NASA_URL, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                data = resp.read()
+                with open(zip_path, "wb") as f:
+                    f.write(data)
+            logger.info(f"Downloaded {len(data) / 1e6:.1f} MB")
+        except Exception as e:
+            logger.error(f"FATAL: Failed to download NASA dataset: {e}")
+            raise RuntimeError(f"Cannot download NASA data. Aborting — NO SYNTHETIC FALLBACK.")
+
+    # Extract
+    extract_dir = os.path.join(raw_dir, "nasa_extracted")
+    if not os.path.exists(extract_dir):
+        logger.info("Extracting zip...")
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(extract_dir)
+        except Exception as e:
+            logger.error(f"FATAL: Zip extraction failed: {e}")
+            raise RuntimeError(f"NASA zip corrupted. Delete {zip_path} and retry.")
+
+    # Find .mat files
+    mat_files = glob.glob(os.path.join(extract_dir, "**", "B00*.mat"), recursive=True)
+    if len(mat_files) == 0:
+        raise RuntimeError(f"No B00*.mat files found in {extract_dir}. Dataset structure unexpected.")
+
+    logger.info(f"Found {len(mat_files)} .mat files: {[os.path.basename(f) for f in mat_files]}")
+
+    # Parse .mat files
+    from scipy.io import loadmat
+
+    all_records = []
+    cell_lives = {}
+
+    for mat_path in sorted(mat_files):
+        cell_id = os.path.basename(mat_path).replace(".mat", "")
+        logger.info(f"Parsing {cell_id}...")
+
+        try:
+            mat = loadmat(mat_path)
+        except Exception as e:
+            logger.warning(f"Cannot parse {cell_id}: {e}. Skipping.")
+            continue
+
+        # Navigate the nested MATLAB struct
+        # Structure: mat[cell_id]['cycle'][0,0] -> array of cycle structs
+        try:
+            cell_struct = mat[cell_id]
+            cycles = cell_struct['cycle'][0, 0][0]
+        except (KeyError, IndexError) as e:
+            logger.warning(f"Unexpected structure in {cell_id}: {e}. Skipping.")
+            continue
+
+        discharge_caps = []
+        cycle_data = []
+
+        for cyc_idx, cyc in enumerate(cycles):
+            try:
+                cyc_type = str(cyc['type'][0])
+            except:
+                continue
+
+            if cyc_type != 'discharge':
+                continue
+
+            try:
+                data = cyc['data'][0, 0]
+                voltage = data['Voltage_measured'][0, 0].flatten()
+                current = data['Current_measured'][0, 0].flatten()
+                capacity = data['Capacity'][0, 0].flatten()
+                time_arr = data['Time'][0, 0].flatten()
+            except (KeyError, IndexError):
+                continue
+
+            if len(voltage) < 5:
+                continue
+
+            cycle_num = cyc_idx + 1
+            max_cap = float(np.max(np.abs(capacity))) if len(capacity) > 0 else 0.0
+            discharge_caps.append((cycle_num, max_cap))
+
+            cycle_data.append({
+                'cycle_num': cycle_num,
+                'voltage': voltage,
+                'current': current,
+                'capacity': capacity,
+                'time': time_arr
+            })
+
+        if len(discharge_caps) == 0:
+            logger.warning(f"No discharge cycles in {cell_id}. Skipping.")
+            continue
+
+        # Compute cycle_life from capacity fade (80% of initial capacity)
+        discharge_caps.sort(key=lambda x: x[0])
+        c0 = discharge_caps[0][1]
+        threshold = 0.8 * c0
+        cycle_life = discharge_caps[-1][0]  # default: last cycle
+        for cyc_num, cap in discharge_caps:
+            if cap < threshold:
+                cycle_life = cyc_num
+                break
+
+        cell_lives[cell_id] = cycle_life
+        logger.info(f"  {cell_id}: {len(discharge_caps)} discharge cycles, C0={c0:.4f} Ah, EOL={cycle_life}")
+
+        # Extract early cycles for feature engineering
+        for cd in cycle_data:
+            if cd['cycle_num'] > 100:
+                continue
+            for v, c, cap in zip(cd['voltage'], cd['current'], cd['capacity']):
+                all_records.append({
+                    "cell_id": cell_id,
+                    "chemistry": "LCO",
+                    "cycle_number": cd['cycle_num'],
+                    "voltage_V": float(v),
+                    "capacity_Ah": float(cap),
+                    "current_A": float(c),
+                    "cycle_life": cycle_life
+                })
+
+    if len(all_records) == 0:
+        raise RuntimeError("No NASA data parsed. Cannot proceed without real data.")
+
+    result_df = pd.DataFrame(all_records)
+    out_path = os.path.join(proc_dir, "nasa_lco.parquet")
+    result_df.to_parquet(out_path, index=False)
+
+    n_cells = result_df["cell_id"].nunique()
+    logger.info(f"✅ REAL NASA LCO: {n_cells} cells | {len(result_df)} rows | Cell lives: {cell_lives}")
+    logger.info(f"   Saved to: {out_path}")
+    return result_df
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Real Battery Data Acquisition (NO SYNTHETIC FALLBACKS)")
+    parser.add_argument("--raw-dir", type=str, default="data/raw", help="Raw data cache directory")
+    parser.add_argument("--proc-dir", type=str, default="data/real_processed", help="Processed output directory")
+    parser.add_argument("--skip-lfp", action="store_true", help="Skip Stanford LFP if already cached")
+    parser.add_argument("--skip-nasa", action="store_true", help="Skip NASA LCO if already cached")
+    args = parser.parse_args()
+
+    os.makedirs(args.proc_dir, exist_ok=True)
+
+    logger.info("=" * 70)
+    logger.info("REAL DATA ACQUISITION — NO SYNTHETIC FALLBACKS ALLOWED")
+    logger.info("=" * 70)
+
+    # Dataset 1: Stanford LFP
+    lfp_out = os.path.join(args.proc_dir, "stanford_lfp.parquet")
+    if args.skip_lfp and os.path.exists(lfp_out):
+        logger.info(f"Skipping Stanford LFP (already exists at {lfp_out})")
+    else:
+        download_stanford_lfp(args.raw_dir, args.proc_dir)
+
+    # Dataset 2: NASA LCO
+    nasa_out = os.path.join(args.proc_dir, "nasa_lco.parquet")
+    if args.skip_nasa and os.path.exists(nasa_out):
+        logger.info(f"Skipping NASA LCO (already exists at {nasa_out})")
+    else:
+        nasa_raw = os.path.join(args.raw_dir, "nasa_battery")
+        download_nasa_lco(nasa_raw, args.proc_dir)
+
+    logger.info("=" * 70)
+    logger.info("ALL REAL DATA ACQUISITION COMPLETE")
+    logger.info("=" * 70)
+
+
+if __name__ == "__main__":
+    main()
