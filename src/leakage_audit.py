@@ -43,7 +43,7 @@ def check_target_leakage():
     leakage_found = False
 
     # Check raw/processed parquet tables if present
-    for filepath in ["data/patchtst_raw/stanford_lfp.parquet", "data/patchtst_raw/oxford_lco.parquet", "data/patchtst_raw/calce_nmc.parquet"]:
+    for filepath in ["data/real_processed/stanford_lfp.parquet", "data/real_processed/calce/CALCE_CS2_33.parquet"]:
         if os.path.exists(filepath):
             df = pd.read_parquet(filepath)
             max_cycle_in_features = df["cycle_number"].max()
@@ -127,7 +127,7 @@ def check_overlap_leakage():
                 logger.info(f"  [{script_name}] Uses cell-index level splitting. Verifying zero overlap across Cell IDs...")
 
     # Validate cell-level exclusivity on cached data if available
-    for npz_path in ["data/koopman_processed/stanford_lfp_soc.npz", "data/patchtst_processed/stanford_lfp_patches.npz"]:
+    for npz_path in ["data/real_koopman/real_stanford_lfp_soc.npz", "data/real_koopman/real_calce_nmc_soc.npz", "data/real_koopman/real_hust_lfp_soc.npz"]:
         if os.path.exists(npz_path):
             data = np.load(npz_path)
             cells = data["cells"]

@@ -289,7 +289,7 @@ def train_dann_loop(
 
 def main():
     parser = argparse.ArgumentParser(description="Koopman Neural Operator & DANN Domain Adversarial Training")
-    parser.add_argument("--data-dir", type=str, default="data/koopman_processed", help="Universal SOC processed directory")
+    parser.add_argument("--data-dir", type=str, default="data/real_koopman", help="Universal SOC processed directory")
     parser.add_argument("--source-path", type=str, default=None, help="Override: direct path to source .npz (e.g. data/real_koopman/real_stanford_lfp_soc.npz)")
     parser.add_argument("--target-paths", type=str, nargs="+", default=None, help="Override: direct paths to target .npz files")
     parser.add_argument("--target-labels", type=str, nargs="+", default=None, help="Override: labels for target datasets")
@@ -312,7 +312,7 @@ def main():
     logger.info("======================================================================")
 
     # Source path: use --source-path override or default
-    lfp_path = args.source_path if args.source_path else os.path.join(args.data_dir, "stanford_lfp_soc.npz")
+    lfp_path = args.source_path if args.source_path else os.path.join(args.data_dir, "real_stanford_lfp_soc.npz")
 
     if not os.path.exists(lfp_path):
         logger.error(f"Missing source dataset {lfp_path}. Run preprocess_v2.py or preprocess_real_data.py first.")
@@ -388,10 +388,10 @@ def main():
         assert len(args.target_paths) == len(args.target_labels), "--target-paths and --target-labels must have same length"
         targets = [(label, path, label.lower().replace(' ', '_')) for label, path in zip(args.target_labels, args.target_paths)]
     else:
-        lco_path = os.path.join(args.data_dir, "oxford_lco_soc.npz")
-        nmc_path = os.path.join(args.data_dir, "calce_nmc_soc.npz")
+        hust_path = os.path.join(args.data_dir, "real_hust_lfp_soc.npz")
+        nmc_path = os.path.join(args.data_dir, "real_calce_nmc_soc.npz")
         targets = [
-            ("Oxford LCO", lco_path, "oxford_lco"),
+            ("HUST LFP", hust_path, "hust_lfp"),
             ("CALCE NMC", nmc_path, "calce_nmc")
         ]
 
