@@ -13,6 +13,40 @@ import numpy as np
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("DatasetSummary")
 
+def extract_metadata(dataset, cell_id):
+    # Default assumptions based on dataset literature
+    temp = "Unknown"
+    rate = "Unknown"
+    condition = "Standard Cycling"
+    
+    if dataset == "Stanford":
+        temp = "30°C"
+        rate = "Fast Charge (3C-8C) / 1C Discharge"
+        condition = "Fast Charging Study"
+    elif dataset == "CALCE":
+        temp = "Room Temp (~25°C)"
+        rate = "0.5C Charge / 1C Discharge"
+        condition = "Standard Degradation"
+    elif dataset == "HUST":
+        temp = "25°C"
+        rate = "Varied (0.5C-2C)"
+        condition = "Cycle Life Testing"
+    elif dataset == "RWTH":
+        temp = "25°C"
+        rate = "Standard"
+        condition = "Grid Storage / EV Simulation"
+    elif dataset == "SNL":
+        # Parse from filename e.g., SNL_18650_NMC_15C_0-100_0.5-1C_a
+        parts = cell_id.split('_')
+        for p in parts:
+            if p.endswith('C') and p[:-1].isdigit():
+                temp = f"{p[:-1]}°C"
+            elif '-' in p and 'C' in p and not p.startswith('0-100'):
+                rate = p.replace('C', 'C') + " (Charge-Discharge)"
+        condition = "Temperature & Rate Study"
+        
+    return temp, rate, condition
+
 def generate_excel_report(in_dir, out_file):
     if not os.path.exists(in_dir):
         logger.error(f"Input directory {in_dir} does not exist. Run the download scripts first.")
@@ -28,14 +62,17 @@ def generate_excel_report(in_dir, out_file):
         for cell_id in df_lfp["cell_id"].unique():
             cell_df = df_lfp[df_lfp["cell_id"] == cell_id]
             cyc_life = cell_df["cycle_life"].iloc[0]
-            # Get max capacity of the earliest cycle available for this cell
             first_cyc = cell_df["cycle_number"].min()
             initial_cap = cell_df[cell_df["cycle_number"] == first_cyc]["capacity_Ah"].max()
             
+            temp, rate, cond = extract_metadata("Stanford", cell_id)
             records.append({
                 "Dataset": "Stanford",
                 "Cell_ID": cell_id,
                 "Chemistry": "LFP",
+                "Temperature": temp,
+                "Charge_Discharge_Rate": rate,
+                "Operating_Condition": cond,
                 "Initial_Capacity_Ah": initial_cap,
                 "Cycle_Life": cyc_life
             })
@@ -65,10 +102,14 @@ def generate_excel_report(in_dir, out_file):
             first_cyc = df_cell["cycle_number"].min()
             initial_cap = df_cell[df_cell["cycle_number"] == first_cyc]["capacity_Ah"].max()
             
+            temp, rate, cond = extract_metadata(dname.upper(), cell_id)
             records.append({
                 "Dataset": dname.upper(),
                 "Cell_ID": cell_id,
                 "Chemistry": chem,
+                "Temperature": temp,
+                "Charge_Discharge_Rate": rate,
+                "Operating_Condition": cond,
                 "Initial_Capacity_Ah": initial_cap,
                 "Cycle_Life": cyc_life
             })
