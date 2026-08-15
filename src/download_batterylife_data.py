@@ -68,7 +68,18 @@ def process_pkl_data(pkl_data, parquet_path, dataset_name, chemistry, filename):
         cell_id = data.get('cell_id', cell_id)
         # Handle cases where cycle_data is at root or nested
         if 'cycle_data' in data:
-            cycle_data = data['cycle_data']
+            raw_cyc = data['cycle_data']
+            if isinstance(raw_cyc, dict):
+                cycle_data = raw_cyc
+            elif isinstance(raw_cyc, list):
+                for i, cyc_dict in enumerate(raw_cyc):
+                    if isinstance(cyc_dict, dict):
+                        cyc_num = cyc_dict.get('cycle_number', cyc_dict.get('cycle', i + 1))
+                        try:
+                            cyc_num = int(cyc_num)
+                            cycle_data[cyc_num] = cyc_dict
+                        except ValueError:
+                            pass
         else:
             # Maybe the dict itself is cycle data keyed by cycle num
             cycle_data = {k: v for k, v in data.items() if isinstance(k, (int, str)) and str(k).isdigit()}
@@ -211,6 +222,9 @@ def download_and_process_dataset(dataset_name, chemistry, raw_dir, proc_dir, tes
                         sys.exit(1) # Hard crash on synthetic data
     except Exception as e:
         logger.error(f"Failed to read {dataset_name}.zip: {e}")
+        logger.warning(f"Deleting corrupted {zip_path} so it can be re-downloaded next time.")
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
 
 def main():
     parser = argparse.ArgumentParser(description="Real BatteryLife Data Acquisition (Zenodo)")
