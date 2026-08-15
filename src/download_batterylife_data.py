@@ -61,8 +61,28 @@ def process_pkl_data(pkl_data, parquet_path, dataset_name, chemistry, filename):
     """
     data = pickle.loads(pkl_data)
     
-    cell_id = data.get('cell_id', filename.split('.')[0])
-    cycle_data = data.get('cycle_data', {})
+    cell_id = filename.split('.')[0]
+    cycle_data = {}
+    
+    if isinstance(data, dict):
+        cell_id = data.get('cell_id', cell_id)
+        # Handle cases where cycle_data is at root or nested
+        if 'cycle_data' in data:
+            cycle_data = data['cycle_data']
+        else:
+            # Maybe the dict itself is cycle data keyed by cycle num
+            cycle_data = {k: v for k, v in data.items() if isinstance(k, (int, str)) and str(k).isdigit()}
+    elif isinstance(data, list):
+        # List of cycle dictionaries
+        for i, cyc_dict in enumerate(data):
+            if isinstance(cyc_dict, dict):
+                # Try to find a cycle number, fallback to index + 1
+                cyc_num = cyc_dict.get('cycle_number', cyc_dict.get('cycle', i + 1))
+                try:
+                    cyc_num = int(cyc_num)
+                    cycle_data[cyc_num] = cyc_dict
+                except ValueError:
+                    pass
     
     if not cycle_data:
         logger.warning(f"No cycle_data found in {filename}")
