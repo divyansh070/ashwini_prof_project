@@ -139,6 +139,13 @@ def preprocess_real_dataset(parquet_path: str, chem: str, out_path: str):
     # Verify this is REAL data — check voltage steps are non-uniform
     sample_cell = df[df["cell_id"] == cells[0]]
     sample_cyc = sample_cell[sample_cell["cycle_number"] == CYCLES_EVAL[0]]
+    if len(sample_cyc) < 5 and len(CYCLES_EVAL) > 1:
+        # Try finding a valid cycle to test
+        for cyc in CYCLES_EVAL:
+            sample_cyc = sample_cell[sample_cell["cycle_number"] == cyc]
+            if len(sample_cyc) >= 5:
+                break
+
     if len(sample_cyc) > 5:
         v_diffs = np.diff(sample_cyc["voltage_V"].values[:10])
         if len(v_diffs) > 2 and np.all(np.abs(v_diffs - v_diffs[0]) < 1e-10):
@@ -177,14 +184,19 @@ def main():
     lfp_path = os.path.join(args.in_dir, "stanford_lfp.parquet")
     if os.path.exists(lfp_path):
         preprocess_real_dataset(lfp_path, "LFP", os.path.join(args.out_dir, "real_stanford_lfp_soc.npz"))
-    else:
-        logger.warning(f"Missing {lfp_path}. Run download_real_data.py first.")
 
-    nasa_path = os.path.join(args.in_dir, "nasa_lco.parquet")
-    if os.path.exists(nasa_path):
-        preprocess_real_dataset(nasa_path, "LCO", os.path.join(args.out_dir, "real_nasa_lco_soc.npz"))
-    else:
-        logger.warning(f"Missing {nasa_path}. Run download_real_data.py first.")
+    # BatteryLife datasets
+    batterylife_datasets = {
+        "calce": "NMC",
+        "hust": "LFP",
+        "snl": "NMC",
+        "rwth": "NMC"
+    }
+
+    for dname, chem in batterylife_datasets.items():
+        dpath = os.path.join(args.in_dir, dname)
+        if os.path.exists(dpath):
+            preprocess_real_dataset(dpath, chem, os.path.join(args.out_dir, f"real_{dname}_{chem.lower()}_soc.npz"))
 
     logger.info("=" * 70)
     logger.info("REAL DATA PREPROCESSING COMPLETE")
