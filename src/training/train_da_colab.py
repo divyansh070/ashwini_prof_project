@@ -23,7 +23,9 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupKFold, train_test_split
 from sklearn.metrics import mean_absolute_percentage_error, mean_squared_error, r2_score
 
-from koopman_model import BatteryKoopmanDANN
+# Add project root to path so we can import from src.models
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from src.models.koopman_model import BatteryKoopmanDANN
 
 logging.basicConfig(
     level=logging.INFO,

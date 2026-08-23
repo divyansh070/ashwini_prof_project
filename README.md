@@ -29,25 +29,25 @@ We evaluate our zero-shot transfer across five massive, open-source datasets con
 
 ## How to Run the Pipeline (Colab Instructions)
 
-All modeling code is located in the `src/` directory.
+All modeling code is intuitively organized within the `src/` directory.
 
 ### 1. Acquire & Preprocess the Data
 First, download the raw data from Zenodo and HuggingFace, and execute the physics preprocessing.
 ```bash
 # 1. Download Source Data
-python src/download_real_data.py
+python src/downloads/download_real_data.py
 
 # 2. Download Target Data
-python src/download_batterylife_data.py
+python src/downloads/download_batterylife_data.py
 
 # 3. Extract Thermodynamics (dQ/dSOC)
-python src/preprocess_real_data.py
+python src/preprocess/preprocess_real_data.py
 ```
 
 ### 2. The Forensic Data Leakage Audit
 Before training any ML model, you must prove there is zero leakage of future capacity data. The following script will scan all parquet files and assert that no features extracted between Cycle 10 and 100 contain data from Cycle 101+.
 ```bash
-python src/leakage_audit.py
+python src/audit/leakage_audit.py
 ```
 
 ### 3. Train the DANN Pipeline
@@ -57,7 +57,7 @@ Execute the main Colab script. This script will:
 3. Evaluate Zero-Shot performance.
 4. Execute DANN adversarial adaptation to align the physics of the Source and Target datasets.
 ```bash
-python src/koopman/train_da_colab.py --epochs-source 50 --epochs-dann 30
+python src/training/train_da_colab.py --epochs-source 50 --epochs-dann 30
 ```
 
 Results are saved to `results/domain_adversarial_metrics.csv` and PyTorch model checkpoints are saved to the `checkpoints/` directory.
