@@ -1,3 +1,0 @@
-Dataset,Cells,Validation_Protocol,Evaluation_Space,5-Fold_MAPE_%,MAPE_Std_%,Median_MAPE_%,RMSE_cycles,R2_Score
-TRI / Stanford 2020,224,5-Fold GroupKFold CV,Linear (Cycles),5.12,1.24,4.68,68.4,0.892
-HUST 2022,77,5-Fold GroupKFold CV,Linear (Cycles),6.08,1.45,5.31,142.1,0.836
