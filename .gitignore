@@ -13,8 +13,7 @@ ehthumbs.db
 Thumbs.db
 
 # Large raw datasets (>100MB GitHub limit)
-data/raw/
-data/processed/battery_time_series.parquet
+data/
 
 # Environment
 .env
