@@ -43,7 +43,11 @@ def check_target_leakage():
     leakage_found = False
 
     # Check raw/processed parquet tables if present
-    for filepath in ["data/real_processed/stanford_lfp.parquet", "data/real_processed/calce/CALCE_CS2_33.parquet"]:
+    parquet_files = glob.glob("data/real_processed/**/*.parquet", recursive=True)
+    if not parquet_files:
+        logger.warning("No parquet files found in data/real_processed/ for target leakage check.")
+        
+    for filepath in parquet_files:
         if os.path.exists(filepath):
             df = pd.read_parquet(filepath)
             max_cycle_in_features = df["cycle_number"].max()

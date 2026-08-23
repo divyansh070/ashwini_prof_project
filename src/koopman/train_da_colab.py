@@ -389,10 +389,14 @@ def main():
         targets = [(label, path, label.lower().replace(' ', '_')) for label, path in zip(args.target_labels, args.target_paths)]
     else:
         hust_path = os.path.join(args.data_dir, "real_hust_lfp_soc.npz")
-        nmc_path = os.path.join(args.data_dir, "real_calce_nmc_soc.npz")
+        calce_path = os.path.join(args.data_dir, "real_calce_nmc_soc.npz")
+        snl_path = os.path.join(args.data_dir, "real_snl_nmc_soc.npz")
+        rwth_path = os.path.join(args.data_dir, "real_rwth_nmc_soc.npz")
         targets = [
             ("HUST LFP", hust_path, "hust_lfp"),
-            ("CALCE NMC", nmc_path, "calce_nmc")
+            ("CALCE NMC", calce_path, "calce_nmc"),
+            ("SNL NMC", snl_path, "snl_nmc"),
+            ("RWTH NMC", rwth_path, "rwth_nmc")
         ]
 
     X_lfp_fold0_norm = (X_lfp_raw - source_mean_train) / source_std_train
