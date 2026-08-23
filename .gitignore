@@ -31,8 +31,7 @@ venv.bak/
 data/patchtst_raw/
 data/koopman_processed/
 checkpoints/
-models/
-models /
+
 *.parquet
 *.npz
 *.pth
