@@ -3,11 +3,11 @@
 HybridoNet-Adapt Feature Preprocessing Pipeline (Tran et al., 2025).
 
 Exact methodology:
-1. Signal Filtering: Apply median filter (kernel=3) to Voltage (V), Current (I), and Capacity (Q) per cycle.
-2. Statistical Extraction: Extract 6 features (Mean, Std, Min, Max, Var, Median) for each of the 3 signals -> 18 features/cycle.
-3. Window Sampling: Uniformly sample 10 cycles from the first 30 cycles.
-4. Output Tensor: Shape (10, 3, 6) per cell sample.
-5. CRITICAL: Save RAW unscaled feature tensors. Min-Max scaling is fitted ONLY on training splits in train_hybrido.py.
+1. Signal Filtering: 1D median filter (kernel=3) on Voltage (V), Current (I), and Capacity (Q) per cycle.
+2. Statistical Extraction: 6 features (Mean, Std, Min, Max, Var, Median) for each of the 3 signals -> 18 features/cycle.
+3. Observation Window: 30-cycle sliding window, uniformly sampling 10 cycles.
+4. Target Formulation: RUL = EOL - current_cycle (historical-data-independent RUL prediction).
+5. Data Leakage Prevention: Saves RAW unscaled feature tensors. Feature & target scalers are fitted ONLY on training splits in train_hybrido.py.
 """
 
 import os
@@ -23,7 +23,6 @@ try:
     from scipy.signal import medfilt
 except ImportError:
     def medfilt(x, kernel_size=3):
-        # Fallback simple 1D median filter if scipy not installed
         k = kernel_size // 2
         pad_x = np.pad(x, (k, k), mode="edge")
         out = np.zeros_like(x)
@@ -49,7 +48,7 @@ def compute_cycle_statistics(
     Computes 6 statistical features for Voltage, Current, Capacity after median filtering.
     Features: [Mean, Std, Min, Max, Variance, Median]
     Returns:
-        feature_matrix: Shape (3, 6)
+        feature_matrix: Shape (3, 6) -> 18 features
     """
     signals = [voltage, current, capacity]
     feature_matrix = np.zeros((3, 6), dtype=np.float32)
@@ -57,10 +56,8 @@ def compute_cycle_statistics(
     for i, sig in enumerate(signals):
         if len(sig) == 0:
             continue
-        # 1. Apply median filter to remove sudden measurement spikes
         clean_sig = medfilt(sig, kernel_size=filter_kernel)
         
-        # 2. Extract 6 statistical features
         mean_val = float(np.mean(clean_sig))
         std_val = float(np.std(clean_sig))
         min_val = float(np.min(clean_sig))
@@ -73,28 +70,20 @@ def compute_cycle_statistics(
     return feature_matrix
 
 
-def extract_cell_tensor(
+def extract_window_tensor(
     cycle_data: Dict[int, Dict[str, np.ndarray]],
-    window_size: int = 30,
+    window_cycles: List[int],
     num_samples: int = 10
 ) -> Optional[np.ndarray]:
     """
-    Uniformly samples `num_samples` cycles from a `window_size` observation window.
+    Uniformly samples `num_samples` (10) cycles from a list of window cycles (e.g. 30 cycles).
     Returns:
-        tensor: Shape (num_samples=10, channels=3, features=6)
+        tensor: Shape (10, 3, 6)
     """
-    available_cycles = sorted([c for c in cycle_data.keys() if c > 0])
-    # Filter cycles within observation window (e.g., first 30 cycles)
-    window_cycles = [c for c in available_cycles if c <= window_size]
-
     if len(window_cycles) < num_samples:
-        # Fallback if 1-indexed cycles start slightly later or have gaps
-        if len(available_cycles) >= num_samples:
-            window_cycles = available_cycles[:window_size]
-        else:
-            return None
+        return None
 
-    # Uniform sampling of 10 cycles across the window
+    # Uniform 10-cycle sampling
     idx_uniform = np.linspace(0, len(window_cycles) - 1, num_samples, dtype=int)
     selected_cycles = [window_cycles[i] for i in idx_uniform]
 
@@ -111,30 +100,81 @@ def extract_cell_tensor(
     return cell_tensor
 
 
+def extract_cell_samples(
+    cycle_data: Dict[int, Dict[str, np.ndarray]],
+    eol: float,
+    window_size: int = 30,
+    stride: int = 30,
+    num_samples: int = 10,
+    rolling: bool = True
+) -> Tuple[List[np.ndarray], List[float]]:
+    """
+    Extracts 10x3x6 tensors and true RUL targets (RUL = EOL - current_cycle).
+    If rolling=True: extracts multiple 30-cycle sliding windows throughout cell life.
+    If rolling=False: extracts only the first 30-cycle window (RUL = EOL - 30).
+    """
+    available_cycles = sorted([c for c in cycle_data.keys() if c > 0])
+    if len(available_cycles) < window_size:
+        return [], []
+
+    samples = []
+    ruls = []
+
+    if not rolling:
+        # Single early-life window [1..30]
+        window = [c for c in available_cycles if c <= window_size]
+        if len(window) >= num_samples:
+            tensor = extract_window_tensor(cycle_data, window, num_samples)
+            if tensor is not None and not np.isnan(tensor).any():
+                samples.append(tensor)
+                ruls.append(max(0.0, float(eol - window[-1])))
+        return samples, ruls
+
+    # Rolling windows [t-window_size+1 .. t]
+    max_cyc = available_cycles[-1]
+    for end_idx in range(window_size, len(available_cycles) + 1, stride):
+        window = available_cycles[end_idx - window_size:end_idx]
+        current_cycle = window[-1]
+        
+        # Stop window extraction if we have exceeded 80% of EOL (standard RUL evaluation convention)
+        if current_cycle >= eol:
+            break
+
+        tensor = extract_window_tensor(cycle_data, window, num_samples)
+        if tensor is not None and not np.isnan(tensor).any():
+            true_rul = float(eol - current_cycle)
+            samples.append(tensor)
+            ruls.append(true_rul)
+
+    return samples, ruls
+
+
 def process_parquet_dataset(
     parquet_path: str,
     domain_name: str,
     window_size: int = 30,
-    num_samples: int = 10
+    stride: int = 30,
+    num_samples: int = 10,
+    rolling: bool = True
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
-    Processes a standardized battery parquet file and extracts raw unscaled feature tensors.
+    Processes standardized battery parquets and extracts raw unscaled feature tensors + RUL labels.
     """
     if not os.path.exists(parquet_path):
         logger.warning(f"File not found: {parquet_path}")
-        return np.empty((0, 10, 3, 6)), np.empty((0,)), []
+        return np.empty((0, num_samples, 3, 6)), np.empty((0,)), []
 
     df = pd.read_parquet(parquet_path)
     cell_ids = df["cell_id"].unique()
     
-    tensors = []
-    labels = []
-    valid_ids = []
+    all_tensors = []
+    all_ruls = []
+    all_sample_ids = []
 
     for cid in cell_ids:
         cell_df = df[df["cell_id"] == cid]
         
-        # Determine cycle life label (End of Life)
+        # Determine cell End of Life (EOL)
         if "cycle_life" in cell_df.columns and not cell_df["cycle_life"].isna().all():
             eol = float(cell_df["cycle_life"].dropna().iloc[0])
         elif "max_cycle" in cell_df.columns and not cell_df["max_cycle"].isna().all():
@@ -142,65 +182,62 @@ def process_parquet_dataset(
         else:
             eol = float(cell_df["cycle_number"].max())
 
-        # Collect raw time series per cycle
         cycle_data = {}
         for cyc_num, group in cell_df.groupby("cycle_number"):
-            if cyc_num > window_size and len(cycle_data) >= window_size:
-                break
             v = group["voltage"].values if "voltage" in group.columns else group.get("V", pd.Series()).values
             i = group["current"].values if "current" in group.columns else group.get("I", pd.Series()).values
             q = group["discharge_capacity"].values if "discharge_capacity" in group.columns else group.get("capacity", pd.Series()).values
-
             cycle_data[int(cyc_num)] = {"voltage": v, "current": i, "capacity": q}
 
-        cell_tensor = extract_cell_tensor(cycle_data, window_size=window_size, num_samples=num_samples)
-        if cell_tensor is not None and not np.isnan(cell_tensor).any():
-            tensors.append(cell_tensor)
-            labels.append(eol)
-            valid_ids.append(f"{domain_name}_{cid}")
+        tensors, ruls = extract_cell_samples(
+            cycle_data, eol, window_size=window_size, stride=stride, num_samples=num_samples, rolling=rolling
+        )
 
-    if len(tensors) == 0:
+        for s_idx, (t_mat, r_val) in enumerate(zip(tensors, ruls)):
+            all_tensors.append(t_mat)
+            all_ruls.append(r_val)
+            all_sample_ids.append(f"{domain_name}_{cid}_w{s_idx}")
+
+    if len(all_tensors) == 0:
         return np.empty((0, num_samples, 3, 6)), np.empty((0,)), []
 
-    return np.array(tensors, dtype=np.float32), np.array(labels, dtype=np.float32), valid_ids
+    return np.array(all_tensors, dtype=np.float32), np.array(all_ruls, dtype=np.float32), all_sample_ids
 
 
 def main():
-    parser = argparse.ArgumentParser(description="HybridoNet-Adapt Raw Feature Preprocessing")
+    parser = argparse.ArgumentParser(description="HybridoNet-Adapt Rolling RUL Preprocessing")
     parser.add_argument("--data-dir", type=str, default="data/real_processed", help="Directory containing processed battery parquets")
     parser.add_argument("--output-dir", type=str, default="data/hybridonet/processed", help="Output directory for raw unscaled tensors")
-    parser.add_argument("--window-size", type=int, default=30, help="Initial cycle window size")
+    parser.add_argument("--window-size", type=int, default=30, help="Observation window size (cycles)")
+    parser.add_argument("--stride", type=int, default=30, help="Window stride for rolling RUL samples")
     parser.add_argument("--num-samples", type=int, default=10, help="Uniformly sampled cycles in window")
+    parser.add_argument("--early-only", action="store_true", help="Extract only early-cycle (first window) rather than full rolling RUL")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
-    logger.info("Starting HybridoNet-Adapt raw feature extraction...")
+    rolling = not args.early_only
+    logger.info(f"Extracting HybridoNet features (Rolling RUL mode: {rolling}, Window: {args.window_size}, Stride: {args.stride})...")
 
-    # Look for available battery datasets
     parquet_files = glob.glob(os.path.join(args.data_dir, "*.parquet"))
     if not parquet_files:
-        logger.info(f"No parquets found in {args.data_dir}. Searching project root for available parquet files...")
         parquet_files = glob.glob("data/**/*.parquet", recursive=True)
 
-    summary_records = []
     for p_file in parquet_files:
         domain = os.path.splitext(os.path.basename(p_file))[0]
-        X, Y, cell_ids = process_parquet_dataset(p_file, domain, window_size=args.window_size, num_samples=args.num_samples)
+        X, Y, sample_ids = process_parquet_dataset(
+            p_file, domain, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
+        )
         if len(X) > 0:
             out_file = os.path.join(args.output_dir, f"{domain}_raw_features.npz")
             np.savez_compressed(
                 out_file,
-                X=X, # Shape (N, 10, 3, 6) - RAW UNSCALED
-                Y=Y, # Shape (N,) - RAW cycle life
-                cell_ids=np.array(cell_ids)
+                X=X, # (N_samples, 10, 3, 6) - RAW UNSCALED
+                Y=Y, # (N_samples,) - TRUE RUL (EOL - current_cycle)
+                sample_ids=np.array(sample_ids)
             )
-            logger.info(f"Saved {domain}: {X.shape[0]} cells, Tensor Shape: {X.shape} -> {out_file}")
-            summary_records.append({"domain": domain, "cells": len(X), "tensor_shape": str(X.shape)})
+            logger.info(f"Saved {domain}: {len(X)} samples, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
 
-    if not summary_records:
-        logger.warning("No parquets processed. Ensure dataset download scripts have run.")
-    else:
-        logger.info("Raw feature extraction completed with zero global scaling leakage.")
+    logger.info("Raw feature extraction completed with zero global scaling leakage.")
 
 
 if __name__ == "__main__":

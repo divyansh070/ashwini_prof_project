@@ -5,27 +5,24 @@ from typing import Tuple, Optional
 
 class ODEFunc(nn.Module):
     """
-    Derivative function dz/dt = f(z, t) parameterized by a neural network.
+    Derivative function dz/dt = f(z, t).
+    Faithful to paper: f is realized as a single linear layer: dz/dt = W*z + b.
     """
     def __init__(self, hidden_dim: int = 64):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, t: float, z: torch.Tensor) -> torch.Tensor:
-        return self.net(z)
+        return self.linear(z)
 
 
 class NeuralODEBlock(nn.Module):
     """
     Modular Neural Ordinary Differential Equation (NODE) Block.
-    Integrates hidden state trajectory over continuous time [0, 1] using Runge-Kutta 4 (RK4).
-    Can be replaced directly with a Koopman Operator block.
+    Integrates hidden state trajectory over continuous time using Runge-Kutta 4 (RK4).
+    Evaluates at continuous integration step (t=2 / 2 integration steps).
     """
-    def __init__(self, hidden_dim: int = 64, num_steps: int = 4):
+    def __init__(self, hidden_dim: int = 64, num_steps: int = 2):
         super().__init__()
         self.ode_func = ODEFunc(hidden_dim)
         self.num_steps = num_steps
@@ -38,8 +35,7 @@ class NeuralODEBlock(nn.Module):
         return z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z shape: (Batch, Seq_Len, Hidden_Dim) or (Batch, Hidden_Dim)
-        dt = 1.0 / self.num_steps
+        dt = 1.0 / max(1, self.num_steps)
         t = 0.0
         for _ in range(self.num_steps):
             z = self._rk4_step(self.ode_func, t, z, dt)
@@ -49,10 +45,11 @@ class NeuralODEBlock(nn.Module):
 
 class FeatureExtractor(nn.Module):
     """
-    HybridoNet Temporal Feature Extractor:
+    HybridoNet-Adapt Feature Extractor (Tran et al., 2025):
     1. 2-layer LSTM (input_dim=18 -> hidden_dim=64)
     2. Multihead Attention (embed_dim=64)
-    3. Neural ODE (NODE) block (modular & swappable)
+    3. Second-to-last attention timestep selection (h_{t=-2})
+    4. Neural ODE (NODE) continuous dynamics block
     """
     def __init__(
         self,
@@ -84,30 +81,30 @@ class FeatureExtractor(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
-        # 3. Modular Neural ODE Block (or custom operator)
-        self.node = ode_block if ode_block is not None else NeuralODEBlock(hidden_dim=hidden_dim)
+        # 3. Modular Neural ODE Block
+        self.node = ode_block if ode_block is not None else NeuralODEBlock(hidden_dim=hidden_dim, num_steps=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Input x: (Batch, Seq_Len=10, Channels=3, Features=6) -> flattened to (Batch, 10, 18)
-        Output: (Batch, hidden_dim=64)
+        Input x: (Batch, Seq_Len=10, Channels=3, Features=6) -> (Batch, 10, 18)
+        Output: Latent state z (Batch, 64)
         """
         if x.dim() == 4:
             b, s, c, f = x.shape
             x = x.view(b, s, c * f)
 
-        # LSTM temporal feature encoding
-        lstm_out, _ = self.lstm(x)  # (B, S, 64)
+        # LSTM temporal feature encoding -> (B, S=10, 64)
+        lstm_out, _ = self.lstm(x)
 
-        # Multihead Attention with residual & LayerNorm
-        attn_out, _ = self.mha(lstm_out, lstm_out, lstm_out)  # (B, S, 64)
-        h = self.layer_norm(lstm_out + attn_out)
+        # Multihead Attention with residual connection & LayerNorm
+        attn_out, _ = self.mha(lstm_out, lstm_out, lstm_out)
+        h = self.layer_norm(lstm_out + attn_out)  # (B, S=10, 64)
 
-        # Temporal aggregation (mean pooling over sequence steps)
-        h_pooled = h.mean(dim=1)  # (B, 64)
+        # Paper-faithful: Select second-to-last attention timestep (-2)
+        h_selected = h[:, -2, :]  # (B, 64)
 
         # Continuous state evolution via Neural ODE
-        z = self.node(h_pooled)  # (B, 64)
+        z = self.node(h_selected)  # (B, 64)
         return z
 
 
@@ -148,11 +145,8 @@ class HybridoNetAdapt(nn.Module):
     HybridoNet-Adapt (Tran et al., 2025)
     Complete Domain Adaptation Architecture for Battery RUL.
     
-    Structure:
-    - Feature Extractor (LSTM + MHA + NODE) -> feature embedding z (64-D)
-    - Source Predictor P^S -> y_hat_s
-    - Target Predictor P^T -> y_hat_t
-    - Combined Target Prediction: Y_hat_T = theta_s * y_hat_s + theta_t * y_hat_t
+    Target prediction formula:
+        Y_hat_T = theta_S * G_Y^S(G_F(X)) + theta_T * G_Y^T(G_F(X))
     """
     def __init__(
         self,
@@ -164,7 +158,7 @@ class HybridoNetAdapt(nn.Module):
         ode_block: Optional[nn.Module] = None
     ):
         super().__init__()
-        # Shared Feature Extractor
+        # Shared Feature Extractor G_F
         self.feature_extractor = FeatureExtractor(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -174,7 +168,7 @@ class HybridoNetAdapt(nn.Module):
             ode_block=ode_block
         )
 
-        # Dual Predictors
+        # Dual Predictors G_Y^S and G_Y^T
         self.source_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
         self.target_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
 
@@ -193,13 +187,13 @@ class HybridoNetAdapt(nn.Module):
             y_hat_comb: Combined target prediction = theta_s * y_hat_s + theta_t * y_hat_t
             y_hat_s: Source predictor output
             y_hat_t: Target predictor output
-            z: Latent feature embedding (for MMD loss computation)
+            z: Latent feature embedding
         """
         z = self.extract_features(x)
         y_hat_s = self.source_predictor(z)
         y_hat_t = self.target_predictor(z)
         
-        # Direct weighted sum without denominator as defined in paper
+        # Direct sum weighting as specified in Eq. (11)
         y_hat_comb = self.theta_s * y_hat_s + self.theta_t * y_hat_t
         
         return y_hat_comb, y_hat_s, y_hat_t, z

@@ -3,13 +3,16 @@
 HybridoNet-Adapt Training and Evaluation Pipeline (Tran et al., 2025).
 
 Implements:
-1. Combined Loss: L_total = L_MSE(Source) + L_MSE(Target) + lambda(p) * L_MMD
-2. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-gamma * p)) - 1, with gamma=10, p = epoch / total_epochs
-3. Zero Data Leakage: Min-Max scalers for features and RUL targets are strictly fitted ONLY on the training folds.
+1. Combined Objective: L_total = L_MSE(Source) + L_MSE(Target_Combined) + lambda(p) * L_MMD
+2. Exact Trainable Trade-Off Optimization: Target loss is MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target)
+3. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
+4. Scientific Validation: Model selection is driven strictly by validation loss. Test set is evaluated ONLY ONCE at the end.
+5. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
 """
 
 import os
 import sys
+import copy
 import argparse
 import logging
 import numpy as np
@@ -17,13 +20,11 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import KFold
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 import glob
 from typing import Tuple, Dict, List
-from sklearn.model_selection import KFold, train_test_split
-
 
 # Add directory and project root to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -64,24 +65,35 @@ def compute_dynamic_lambda(epoch: int, total_epochs: int, gamma: float = 10.0) -
     p = float(epoch) / float(max(1, total_epochs))
     return float(2.0 / (1.0 + np.exp(-gamma * p)) - 1.0)
 
-def fit_and_transform_features(
+
+def fit_and_transform_features_18d(
     X_train: np.ndarray,
     X_val: np.ndarray,
     X_tgt_adapt: np.ndarray,
     X_tgt_test: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
-    """Dynamically fits MinMaxScaler ONLY on X_train."""
-    n_tr, seq, ch, feat = X_train.shape
-    X_tr_flat = X_train.reshape(n_tr, seq * ch * feat)
+    """
+    Fits MinMaxScaler across all samples and time steps over the 18 physical feature dimensions.
+    X shape: (N, 10, 3, 6) -> (N, 10, 18) -> reshape(-1, 18) for scaling.
+    """
+    def to_flat18(arr):
+        n, s, c, f = arr.shape
+        return arr.reshape(n * s, c * f), (n, s, c, f)
 
+    X_tr_flat, orig_shape_tr = to_flat18(X_train)
     scaler = MinMaxScaler(feature_range=(0.0, 1.0))
-    X_tr_scaled = scaler.fit_transform(X_tr_flat).reshape(n_tr, seq, ch, feat)
+    X_tr_sc = scaler.fit_transform(X_tr_flat).reshape(orig_shape_tr)
 
-    X_val_scaled = scaler.transform(X_val.reshape(X_val.shape[0], seq * ch * feat)).reshape(X_val.shape[0], seq, ch, feat)
-    X_tgt_adapt_scaled = scaler.transform(X_tgt_adapt.reshape(X_tgt_adapt.shape[0], seq * ch * feat)).reshape(X_tgt_adapt.shape[0], seq, ch, feat)
-    X_tgt_test_scaled = scaler.transform(X_tgt_test.reshape(X_tgt_test.shape[0], seq * ch * feat)).reshape(X_tgt_test.shape[0], seq, ch, feat)
+    X_val_flat, orig_shape_val = to_flat18(X_val)
+    X_val_sc = scaler.transform(X_val_flat).reshape(orig_shape_val)
 
-    return X_tr_scaled, X_val_scaled, X_tgt_adapt_scaled, X_tgt_test_scaled, scaler
+    X_tgt_ad_flat, orig_shape_ad = to_flat18(X_tgt_adapt)
+    X_tgt_ad_sc = scaler.transform(X_tgt_ad_flat).reshape(orig_shape_ad)
+
+    X_tgt_ts_flat, orig_shape_ts = to_flat18(X_tgt_test)
+    X_tgt_ts_sc = scaler.transform(X_tgt_ts_flat).reshape(orig_shape_ts)
+
+    return X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler
 
 
 def fit_and_transform_targets(
@@ -90,7 +102,7 @@ def fit_and_transform_targets(
     Y_tgt_adapt: np.ndarray,
     Y_tgt_test: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
-    """Fits target MinMaxScaler ONLY on Y_train."""
+    """Fits target MinMaxScaler ONLY on Y_train to match Sigmoid activation [0, 1]."""
     scaler_y = MinMaxScaler(feature_range=(0.0, 1.0))
     Y_tr_scaled = scaler_y.fit_transform(Y_train.reshape(-1, 1)).flatten()
     Y_val_scaled = scaler_y.transform(Y_val.reshape(-1, 1)).flatten()
@@ -99,29 +111,32 @@ def fit_and_transform_targets(
 
     return Y_tr_scaled, Y_val_scaled, Y_tgt_adapt_scaled, Y_tgt_test_scaled, scaler_y
 
-def train_single_fold(
+
+def train_hybrido_session(
     model: nn.Module,
     source_loader: DataLoader,
     target_loader: DataLoader,
     val_loader: DataLoader,
     target_test_loader: DataLoader,
-    target_y_raw: np.ndarray,
+    target_y_test_raw: np.ndarray,
+    val_y_raw: np.ndarray,
     scaler_y: MinMaxScaler,
-    epochs: int = 50,
-    lr: float = 1e-3,
+    epochs: int = 10,
+    lr: float = 0.0005,
     sigma_mmd: float = 1.0,
     device: str = "cpu"
 ) -> Dict[str, float]:
     """
-    Executes the HybridoNet domain adaptation training loop.
+    Paper-faithful training loop with validation-driven checkpoint selection and trainable theta parameters.
     """
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion_mse = nn.MSELoss()
     mmd_loss_fn = MMDLoss(sigma=sigma_mmd, fix_sigma=True)
 
-    best_test_rmse = float("inf")
-    best_metrics = {}
+    best_val_rmse = float("inf")
+    best_model_state = None
+    best_epoch = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -147,18 +162,19 @@ def train_single_fold(
 
             optimizer.zero_grad()
 
-            # Source forward pass
-            y_comb_s, y_pred_s, _, z_s = model(src_x)
+            # 1. Source forward pass -> predicts y_hat_s
+            _, y_pred_s, _, z_s = model(src_x)
             loss_source = criterion_mse(y_pred_s, src_y)
 
-            # Target forward pass
-            y_comb_t, _, y_pred_t, z_t = model(tgt_x)
-            loss_target = criterion_mse(y_pred_t, tgt_y)
+            # 2. Target forward pass -> predicts combined Y_hat_T = theta_s * y_s + theta_t * y_t
+            y_comb_t, _, _, z_t = model(tgt_x)
+            # CRITICAL FIX: Target loss is evaluated on combined output so theta_s, theta_t are actively trained!
+            loss_target = criterion_mse(y_comb_t, tgt_y)
 
-            # Maximum Mean Discrepancy (MMD) Loss
+            # 3. Maximum Mean Discrepancy (MMD) Loss between feature representations
             loss_mmd = mmd_loss_fn(z_s, z_t)
 
-            # Combined Objective
+            # 4. Total Loss
             loss_total = loss_source + loss_target + lambda_p * loss_mmd
 
             loss_total.backward()
@@ -170,53 +186,78 @@ def train_single_fold(
             mmd_loss_accum += loss_mmd.item()
             batches += 1
 
-        # Evaluate on Target Test Set
+        # Validation Step (Model Selection occurs strictly on VALIDATION split)
         model.eval()
-        target_preds = []
+        val_preds = []
         with torch.no_grad():
-            for t_x, _ in target_test_loader:
-                t_x = t_x.to(device)
-                y_comb_t, _, _, _ = model(t_x)
-                target_preds.extend(y_comb_t.cpu().numpy().flatten())
+            for v_x, _ in val_loader:
+                v_x = v_x.to(device)
+                _, y_pred_s, _, _ = model(v_x)
+                val_preds.extend(y_pred_s.cpu().numpy().flatten())
 
-        target_preds = np.array(target_preds).reshape(-1, 1)
-        # Invert target scaling to physical cycle life units
-        target_preds_unscaled = scaler_y.inverse_transform(target_preds).flatten()
+        val_preds = np.array(val_preds).reshape(-1, 1)
+        val_preds_unscaled = scaler_y.inverse_transform(val_preds).flatten()
+        val_rmse = float(np.sqrt(mean_squared_error(val_y_raw, val_preds_unscaled)))
 
-        test_rmse = float(np.sqrt(mean_squared_error(target_y_raw, target_preds_unscaled)))
-        test_mape = float(mean_absolute_percentage_error(target_y_raw, target_preds_unscaled) * 100.0)
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_epoch = epoch
+            best_model_state = copy.deepcopy(model.state_dict())
 
-        if test_rmse < best_test_rmse:
-            best_test_rmse = test_rmse
-            best_metrics = {
-                "best_epoch": epoch,
-                "best_rmse": test_rmse,
-                "best_mape": test_mape,
-                "theta_s": float(model.theta_s.item()),
-                "theta_t": float(model.theta_t.item())
-            }
+        logger.info(
+            f"Epoch [{epoch:03d}/{epochs:03d}] "
+            f"Loss: {total_loss_accum / max(1, batches):.4f} | "
+            f"Src MSE: {src_loss_accum / max(1, batches):.4f} | "
+            f"Tgt MSE: {tgt_loss_accum / max(1, batches):.4f} | "
+            f"MMD: {mmd_loss_accum / max(1, batches):.4f} (lambda={lambda_p:.3f}) | "
+            f"Val RMSE: {val_rmse:.2f} cyc | "
+            f"theta_S: {model.theta_s.item():.3f}, theta_T: {model.theta_t.item():.3f}"
+        )
 
-        if epoch % 10 == 0 or epoch == epochs:
-            logger.info(
-                f"Epoch [{epoch:03d}/{epochs:03d}] "
-                f"Loss: {total_loss_accum / max(1, batches):.4f} | "
-                f"Src MSE: {src_loss_accum / max(1, batches):.4f} | "
-                f"Tgt MSE: {tgt_loss_accum / max(1, batches):.4f} | "
-                f"MMD: {mmd_loss_accum / max(1, batches):.4f} (lambda={lambda_p:.3f}) | "
-                f"Test RMSE: {test_rmse:.2f} cyc | MAPE: {test_mape:.2f}%"
-            )
+    # FINAL STEP: Load best model chosen by validation and evaluate test set EXACTLY ONCE
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
 
-    return best_metrics
+    model.eval()
+    test_preds = []
+    with torch.no_grad():
+        for t_x, _ in target_test_loader:
+            t_x = t_x.to(device)
+            y_comb_t, _, _, _ = model(t_x)
+            test_preds.extend(y_comb_t.cpu().numpy().flatten())
+
+    test_preds = np.array(test_preds).reshape(-1, 1)
+    test_preds_unscaled = scaler_y.inverse_transform(test_preds).flatten()
+
+    final_test_rmse = float(np.sqrt(mean_squared_error(target_y_test_raw, test_preds_unscaled)))
+    final_test_mape = float(mean_absolute_percentage_error(target_y_test_raw, test_preds_unscaled) * 100.0)
+
+    logger.info(f"\n[FINAL TEST EVALUATION] Chosen Epoch: {best_epoch} | Test RMSE: {final_test_rmse:.2f} cycles | Test MAPE: {final_test_mape:.2f}%")
+
+    return {
+        "best_epoch": best_epoch,
+        "best_val_rmse": best_val_rmse,
+        "test_rmse": final_test_rmse,
+        "test_mape": final_test_mape,
+        "final_theta_s": float(model.theta_s.item()),
+        "final_theta_t": float(model.theta_t.item())
+    }
+
 
 def run_benchmark(
     source_npz: str,
     target_npz: str,
-    epochs: int = 50,
-    batch_size: int = 16,
-    lr: float = 1e-3,
-    n_splits: int = 5,
+    epochs: int = 10,
+    batch_size: int = 128,
+    lr: float = 0.0005,
+    val_ratio: float = 0.10,
     device: str = "cpu"
 ):
+    """
+    Paper-faithful benchmark run:
+    90% Source Training / 10% Source Validation.
+    60% Target Adaptation / 40% Target Blind Testing.
+    """
     logger.info(f"Loading Source: {source_npz}")
     src_data = np.load(source_npz)
     X_src_raw, Y_src_raw = src_data["X"], src_data["Y"]
@@ -225,80 +266,71 @@ def run_benchmark(
     tgt_data = np.load(target_npz)
     X_tgt_raw, Y_tgt_raw = tgt_data["X"], tgt_data["Y"]
 
-    # [NEW] Split the target dataset: 60% for adaptation, 40% for blind testing
+    # 1. 90/10 Source train/val split (paper protocol)
+    X_tr_raw, X_val_raw, Y_tr_raw, Y_val_raw = train_test_split(
+        X_src_raw, Y_src_raw, test_size=val_ratio, random_state=42
+    )
+
+    # 2. Target adaptation (train) vs blind test split
     X_tgt_adapt, X_tgt_test, Y_tgt_adapt, Y_tgt_test = train_test_split(
         X_tgt_raw, Y_tgt_raw, test_size=0.40, random_state=42
     )
 
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-    fold_results = []
+    # 3. 18-D Feature and target scaling
+    X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler_x = fit_and_transform_features_18d(
+        X_tr_raw, X_val_raw, X_tgt_adapt, X_tgt_test
+    )
+    Y_tr_sc, Y_val_sc, Y_tgt_ad_sc, Y_tgt_ts_sc, scaler_y = fit_and_transform_targets(
+        Y_tr_raw, Y_val_raw, Y_tgt_adapt, Y_tgt_test
+    )
 
-    for fold, (train_idx, val_idx) in enumerate(kf.split(X_src_raw)):
-        logger.info(f"\n--- FOLD {fold + 1}/{n_splits} ---")
-        X_tr_raw, X_val_raw = X_src_raw[train_idx], X_src_raw[val_idx]
-        Y_tr_raw, Y_val_raw = Y_src_raw[train_idx], Y_src_raw[val_idx]
+    src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(BatteryDataset(X_val_sc, Y_val_sc), batch_size=batch_size, shuffle=False)
+    tgt_loader = DataLoader(BatteryDataset(X_tgt_ad_sc, Y_tgt_ad_sc), batch_size=batch_size, shuffle=True)
+    tgt_test_loader = DataLoader(BatteryDataset(X_tgt_ts_sc, Y_tgt_ts_sc), batch_size=batch_size, shuffle=False)
 
-        # 1. Zero-leakage dynamic scaling with the new target splits
-        X_tr_sc, X_val_sc, X_tgt_adapt_sc, X_tgt_test_sc, scaler_x = fit_and_transform_features(
-            X_tr_raw, X_val_raw, X_tgt_adapt, X_tgt_test
-        )
-        Y_tr_sc, Y_val_sc, Y_tgt_adapt_sc, Y_tgt_test_sc, scaler_y = fit_and_transform_targets(
-            Y_tr_raw, Y_val_raw, Y_tgt_adapt, Y_tgt_test
-        )
+    model = HybridoNetAdapt(
+        input_dim=18,
+        hidden_dim=64,
+        num_lstm_layers=2,
+        num_heads=4,
+        dropout=0.1
+    )
 
-        src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True)
-        val_loader = DataLoader(BatteryDataset(X_val_sc, Y_val_sc), batch_size=batch_size, shuffle=False)
-        
-        # [NEW] Separate loaders for adaptation (train) vs testing
-        tgt_loader = DataLoader(BatteryDataset(X_tgt_adapt_sc, Y_tgt_adapt_sc), batch_size=batch_size, shuffle=True)
-        tgt_test_loader = DataLoader(BatteryDataset(X_tgt_test_sc, Y_tgt_test_sc), batch_size=batch_size, shuffle=False)
+    results = train_hybrido_session(
+        model=model,
+        source_loader=src_loader,
+        target_loader=tgt_loader,
+        val_loader=val_loader,
+        target_test_loader=tgt_test_loader,
+        target_y_test_raw=Y_tgt_test,
+        val_y_raw=Y_val_raw,
+        scaler_y=scaler_y,
+        epochs=epochs,
+        lr=lr,
+        device=device
+    )
 
-        model = HybridoNetAdapt(
-            input_dim=18,
-            hidden_dim=64,
-            num_lstm_layers=2,
-            num_heads=4,
-            dropout=0.1
-        )
-
-        metrics = train_single_fold(
-            model=model,
-            source_loader=src_loader,
-            target_loader=tgt_loader,
-            val_loader=val_loader,
-            target_test_loader=tgt_test_loader,
-            target_y_raw=Y_tgt_test, # [NEW] Pass only the unseen test labels for metrics
-            scaler_y=scaler_y,
-            epochs=epochs,
-            lr=lr,
-            device=device
-        )
-        metrics["fold"] = fold + 1
-        fold_results.append(metrics)
-        logger.info(f"Fold {fold + 1} Best RMSE: {metrics['best_rmse']:.2f} cyc | Best MAPE: {metrics['best_mape']:.2f}%")
-
-    avg_rmse = np.mean([r["best_rmse"] for r in fold_results])
-    avg_mape = np.mean([r["best_mape"] for r in fold_results])
-    logger.info(f"\n==========================================")
-    logger.info(f"HYBRIDONET-ADAPT FINAL 5-FOLD BENCHMARK")
-    logger.info(f"Average Target RMSE: {avg_rmse:.2f} cycles")
-    logger.info(f"Average Target MAPE: {avg_mape:.2f}%")
-    logger.info(f"==========================================")
+    logger.info("\n" + "="*50)
+    logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
+    logger.info(f"Target Test RMSE: {results['test_rmse']:.2f} cycles")
+    logger.info(f"Target Test MAPE: {results['test_mape']:.2f}%")
+    logger.info(f"Trained Trade-off Weights: theta_S={results['final_theta_s']:.4f}, theta_T={results['final_theta_t']:.4f}")
+    logger.info("="*50)
 
 
 def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Benchmark Runner")
     parser.add_argument("--source", type=str, default="", help="Path to source .npz raw features")
     parser.add_argument("--target", type=str, default="", help="Path to target .npz raw features")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (paper default=10)")
+    parser.add_argument("--batch-size", type=int, default=128, help="Batch size (paper default=128)")
+    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
-    # Auto-detect processed npz if not provided
     processed_files = glob.glob("data/hybridonet/processed/*_raw_features.npz")
     if not args.source and processed_files:
         args.source = processed_files[0]
