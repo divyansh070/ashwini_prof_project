@@ -70,6 +70,7 @@ def test_deterministic_attention_timestep():
 
     identity_node = nn.Identity()
     feat_ext.node = identity_node
+    feat_ext.node_layer_norm = identity_node
     feat_ext.eval()
 
     with torch.no_grad():

@@ -47,9 +47,10 @@ class FeatureExtractor(nn.Module):
     """
     HybridoNet-Adapt Feature Extractor (Tran et al., 2025, Table 2):
     1. 2-layer LSTM (input_dim=18 -> hidden_dim=128)
-    2. Multihead Attention (embed_dim=128)
+    2. Multihead Attention (embed_dim=128) + LayerNorm
     3. Last attention timestep selection (h_{t=-1})
-    4. Neural ODE (NODE) continuous dynamics block (hidden_dim=128)
+    4. Neural ODE (NODE) continuous dynamics block (128 -> 128)
+    5. Post-NODE LayerNorm (128 -> 128)
     """
     def __init__(
         self,
@@ -83,6 +84,9 @@ class FeatureExtractor(nn.Module):
 
         # 3. Modular Neural ODE Block (128 -> 128)
         self.node = ode_block if ode_block is not None else NeuralODEBlock(hidden_dim=hidden_dim, num_steps=2)
+        
+        # 4. Table 2: LayerNorm directly following NODE block
+        self.node_layer_norm = nn.LayerNorm(hidden_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -103,26 +107,22 @@ class FeatureExtractor(nn.Module):
         # Published paper: Output from Multihead Attention is taken from the last step along time dimension
         h_selected = h[:, -1, :]  # (B, 128)
 
-        # Continuous state evolution via Neural ODE
+        # Continuous state evolution via Neural ODE + Post-NODE LayerNorm
         z = self.node(h_selected)  # (B, 128)
+        z = self.node_layer_norm(z)  # (B, 128)
         return z
 
 
 class Predictor(nn.Module):
     """
     RUL Predictor Network (Table 2):
-    Linear layers [128, 128, 64, 32, 1] with BatchNorm1d, Dropout(0.1), ReLU,
+    Linear layers [128 -> 64 -> 32 -> 1] with BatchNorm1d, Dropout(0.1), ReLU,
     ending strictly with Sigmoid() activation.
     """
     def __init__(self, in_features: int = 128, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_features, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Dropout(dropout),
-
-            nn.Linear(128, 64),
+            nn.Linear(in_features, 64),
             nn.ReLU(),
             nn.BatchNorm1d(64),
             nn.Dropout(dropout),
@@ -168,7 +168,7 @@ class HybridoNetAdapt(nn.Module):
             ode_block=ode_block
         )
 
-        # Dual Predictors G_Y^S and G_Y^T
+        # Dual Predictors G_Y^S and G_Y^T (128 -> 64 -> 32 -> 1)
         self.source_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
         self.target_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
 
