@@ -334,8 +334,13 @@ def run_benchmark(
         X_tgt_raw, Y_tgt_raw, tgt_cells, test_ratio=0.40, random_state=42
     )
 
-    logger.info(f"Source Cells: {len(np.unique(tr_c))} train, {len(np.unique(val_c))} val")
-    logger.info(f"Target Cells: {len(np.unique(ad_c))} adapt, {len(np.unique(ts_c))} blind test")
+    logger.info("=" * 50)
+    logger.info("DATASET PARTITIONING BREAKDOWN (CELL-LEVEL GROUPING)")
+    logger.info(f"Source Training:   {len(np.unique(tr_c)):3d} cells | {len(X_tr_raw):5d} windows")
+    logger.info(f"Source Validation: {len(np.unique(val_c)):3d} cells | {len(X_val_raw):5d} windows")
+    logger.info(f"Target Adaptation: {len(np.unique(ad_c)):3d} cells | {len(X_tgt_adapt):5d} windows")
+    logger.info(f"Target Blind Test: {len(np.unique(ts_c)):3d} cells | {len(X_tgt_test):5d} windows")
+    logger.info("=" * 50)
 
     # 2. 18-D Feature Scaling across samples and time steps
     X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler_x = fit_and_transform_features_18d(
@@ -389,30 +394,31 @@ def run_benchmark(
 
 def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Benchmark Runner")
-    parser.add_argument("--source", type=str, default="", help="Path to source .npz raw features")
-    parser.add_argument("--target", type=str, default="", help="Path to target .npz raw features")
+    parser.add_argument("--source", type=str, required=True, help="Path to source .npz raw features (REQUIRED)")
+    parser.add_argument("--target", type=str, required=True, help="Path to target .npz raw features (REQUIRED)")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (paper default=10)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size (paper default=128)")
     parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005)")
+    parser.add_argument("--val-ratio", type=float, default=0.10, help="Source cell validation ratio (default 0.10)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
-    processed_files = glob.glob("data/hybridonet/processed/*_raw_features.npz")
-    if not args.source and processed_files:
-        args.source = processed_files[0]
-    if not args.target and len(processed_files) > 1:
-        args.target = processed_files[1]
+    if not os.path.exists(args.source):
+        raise FileNotFoundError(f"Source feature file not found: {args.source}")
+    if not os.path.exists(args.target):
+        raise FileNotFoundError(f"Target feature file not found: {args.target}")
 
-    if not args.source or not args.target:
-        logger.warning(
-            "Source or target .npz files not found. "
-            "Please run 'python src/hybridonet-adapt/preprocess_hybrido.py' first."
-        )
-        return
-
-    run_benchmark(args.source, args.target, epochs=args.epochs, batch_size=args.batch_size, lr=args.lr, device=device)
+    run_benchmark(
+        source_npz=args.source,
+        target_npz=args.target,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        val_ratio=args.val_ratio,
+        device=device
+    )
 
 
 if __name__ == "__main__":
