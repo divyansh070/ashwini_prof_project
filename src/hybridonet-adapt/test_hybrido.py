@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-HybridoNet-Adapt Comprehensive Verification Test Suite.
+HybridoNet-Adapt Comprehensive Verification Test Suite (7/7 Tests).
 Validates:
 1. Linear NODE Derivative (dh/dt = Wh + b)
 2. Deterministic Attention Timestep Selection (index -2)
 3. Active Gradient Flow on Trade-Off Parameters (theta_s, theta_t)
 4. Rolling Window RUL Formulation (RUL = EOL - current_cycle)
-5. Zero Intra-Battery Leakage: Cell-Level Group Splitting
-6. Robust RUL Normalization (No Sigmoid Saturation)
+5. Zero Intra-Battery Leakage: Cell-Level Group Splitting & ValueError on Single Cell
+6. Fixed Physical RUL Normalization Ceiling (5000 cyc, No Sigmoid Saturation)
+7. 18-D Feature Scaling across time and samples
 """
 
 import sys
@@ -35,12 +36,13 @@ from train_hybrido import (
     compute_dynamic_lambda,
     fit_and_transform_features_18d,
     split_by_cell_id,
-    RobustRULScaler
+    RobustRULScaler,
+    DEFAULT_RUL_MAX_CEILING
 )
 
 
 def test_linear_node_derivative():
-    print("[TEST 1/6] Testing Linear NODE Derivative (dh/dt = Wh + b)...")
+    print("[TEST 1/7] Testing Linear NODE Derivative (dh/dt = Wh + b)...")
     ode_f = ODEFunc(hidden_dim=64)
     assert hasattr(ode_f, "linear") and isinstance(ode_f.linear, nn.Linear), "ODEFunc must be a single linear layer per paper"
     assert not hasattr(ode_f, "net"), "ODEFunc should not be an MLP"
@@ -55,14 +57,13 @@ def test_linear_node_derivative():
 
 
 def test_deterministic_attention_timestep():
-    print("[TEST 2/6] Testing Deterministic Multihead Attention Timestep (-2) Selection...")
+    print("[TEST 2/7] Testing Deterministic Multihead Attention Timestep (-2) Selection...")
     feat_ext = FeatureExtractor(input_dim=18, hidden_dim=64, num_lstm_layers=2, num_heads=4, dropout=0.0)
     
     # Create input tensor where step index -2 (i.e. index 8 out of 10) has a distinct magnitude
     x = torch.zeros(2, 10, 3, 6)
     x[:, 8, :, :] = 10.0 # Distinct marker on timestep index 8 (second-to-last)
 
-    # Disable ODE dynamics temporarily to probe the exact timestep passed from MHA
     identity_node = nn.Identity()
     feat_ext.node = identity_node
     feat_ext.eval()
@@ -70,8 +71,6 @@ def test_deterministic_attention_timestep():
     with torch.no_grad():
         z_selected = feat_ext(x) # (2, 64)
         
-        # Now run a synthetic test comparing against step 9 (last) vs step 8 (second-to-last)
-        # Using forward hook on layer_norm
         captured_h = []
         def hook_fn(m, inp, out):
             captured_h.append(out.detach())
@@ -96,7 +95,7 @@ def test_deterministic_attention_timestep():
 
 
 def test_theta_gradient_flow():
-    print("[TEST 3/6] Testing Trainable Trade-off Parameters (theta_S, theta_T) Gradient Flow...")
+    print("[TEST 3/7] Testing Trainable Trade-off Parameters (theta_S, theta_T) Gradient Flow...")
     model = HybridoNetAdapt(input_dim=18, hidden_dim=64, num_lstm_layers=2, num_heads=4, dropout=0.1)
     criterion_mse = nn.MSELoss()
 
@@ -114,9 +113,34 @@ def test_theta_gradient_flow():
     print(f"  -> Gradient Flow verified: dL/dtheta_S = {model.theta_s.grad.item():.6f}, dL/dtheta_T = {model.theta_t.grad.item():.6f}")
 
 
+def test_rolling_window_rul_preprocessing():
+    print("[TEST 4/7] Testing Rolling Window RUL Formulation (RUL = EOL - current_cycle)...")
+    # Simulate a cell with EOL = 200 cycles
+    cycle_data = {}
+    for c in range(1, 150):
+        v = np.linspace(3.0, 4.2, 50)
+        i = np.ones(50) * 1.5
+        q = np.linspace(0.0, 1.1, 50)
+        cycle_data[c] = {"voltage": v, "current": i, "capacity": q}
+
+    eol = 200.0
+    samples, ruls = extract_cell_samples(cycle_data, eol, window_size=30, stride=30, num_samples=10, rolling=True)
+    
+    assert len(samples) >= 3, f"Expected at least 3 rolling windows, got {len(samples)}"
+    assert samples[0].shape == (10, 3, 6), f"Expected tensor shape (10, 3, 6), got {samples[0].shape}"
+    
+    # Check exact mathematical RUL values:
+    # Window 1 ends at cycle 30 -> RUL = 200 - 30 = 170
+    # Window 2 ends at cycle 60 -> RUL = 200 - 60 = 140
+    # Window 3 ends at cycle 90 -> RUL = 200 - 90 = 110
+    assert ruls[0] == 170.0, f"Expected Window 1 RUL=170.0, got {ruls[0]}"
+    assert ruls[1] == 140.0, f"Expected Window 2 RUL=140.0, got {ruls[1]}"
+    assert ruls[2] == 110.0, f"Expected Window 3 RUL=110.0, got {ruls[2]}"
+    print(f"  -> Rolling RUL test passed: Window 1 (cycle 30) RUL={ruls[0]}, Window 2 (cycle 60) RUL={ruls[1]}, Window 3 (cycle 90) RUL={ruls[2]}")
+
+
 def test_cell_level_disjoint_splitting():
-    print("[TEST 4/6] Testing Zero Intra-Battery Leakage: Cell-Level Group Splitting...")
-    # Simulate 5 unique batteries with 4 windows each = 20 total samples
+    print("[TEST 5/7] Testing Zero Intra-Battery Leakage: Cell-Level Group Splitting...")
     cell_names = ["cell_A", "cell_B", "cell_C", "cell_D", "cell_E"]
     cell_ids = np.repeat(cell_names, 4)
     X = np.random.randn(20, 10, 3, 6).astype(np.float32)
@@ -132,28 +156,37 @@ def test_cell_level_disjoint_splitting():
     assert tr_unique.isdisjoint(ts_unique), f"Leakage detected! Shared cells: {tr_unique.intersection(ts_unique)}"
     assert len(tr_unique) + len(ts_unique) == len(cell_names), "Lost unique cells during partitioning"
     assert len(X_tr) + len(X_ts) == 20, "Lost sample windows during split"
-    print(f"  -> Cell-level split verified: Train cells={tr_unique}, Test cells={ts_unique} (Zero overlap)")
+
+    # Test that single cell dataset raises ValueError rather than falling back to random window split
+    single_cell_ids = np.repeat(["cell_solo"], 10)
+    try:
+        _ = split_by_cell_id(X[:10], Y[:10], single_cell_ids, test_ratio=0.2)
+        assert False, "Failed to raise ValueError on single-cell dataset!"
+    except ValueError:
+        pass # Expected
+
+    print("  -> Cell-level split test passed: Zero window overlap and ValueError on single cell verified.")
 
 
-def test_robust_rul_scaling():
-    print("[TEST 5/6] Testing Robust RUL Normalization (No Sigmoid Saturation)...")
-    # Source battery RUL: [50, 1800]
-    Y_source = np.array([50.0, 500.0, 1200.0, 1800.0])
-    # Target battery RUL exceeds source: [100, 3200]
-    Y_target = np.array([100.0, 1500.0, 2500.0, 3200.0])
-
-    scaler = RobustRULScaler().fit(Y_source, Y_target)
-    Y_tgt_norm = scaler.transform(Y_target)
-
-    assert (Y_tgt_norm >= 0.0).all() and (Y_tgt_norm <= 1.0).all(), f"Target RUL saturated or exceeded [0, 1]: {Y_tgt_norm}"
+def test_fixed_ceiling_rul_scaling():
+    print("[TEST 6/7] Testing Fixed Physical RUL Normalization Ceiling (5000 cyc)...")
+    # Fixed physical ceiling scaler
+    scaler = RobustRULScaler(y_max=DEFAULT_RUL_MAX_CEILING)
     
-    Y_reconstructed = scaler.inverse_transform(Y_tgt_norm)
-    assert np.allclose(Y_target, Y_reconstructed, atol=1e-3), "Inverse transform failed to accurately recover true cycle life"
-    print(f"  -> Robust RUL scaling verified: Y_max ceiling={scaler.y_max:.0f} cyc, Target Max Scaled={Y_tgt_norm.max():.4f}")
+    # Diverse target RULs including extreme long-life cells
+    Y_test = np.array([50.0, 1200.0, 3200.0, 4800.0])
+    Y_scaled = scaler.transform(Y_test)
+
+    assert (Y_scaled >= 0.0).all() and (Y_scaled <= 1.0).all(), f"RUL out of [0, 1] bounds: {Y_scaled}"
+    assert Y_scaled.max() < 1.0, f"Max value hit saturation: {Y_scaled.max()}"
+
+    Y_recovered = scaler.inverse_transform(Y_scaled)
+    assert np.allclose(Y_test, Y_recovered, atol=1e-3), "Inverse transform failed to accurately recover true cycle life"
+    print(f"  -> Fixed ceiling test passed: Y_max={scaler.y_max:.0f} cyc, Scaled range=[{Y_scaled.min():.4f}, {Y_scaled.max():.4f}]")
 
 
 def test_18d_feature_scaling():
-    print("[TEST 6/6] Testing 18-D Feature Scaling across time steps and samples...")
+    print("[TEST 7/7] Testing 18-D Feature Scaling across time steps and samples...")
     X_tr = np.random.uniform(10.0, 50.0, (20, 10, 3, 6))
     X_val = np.random.uniform(10.0, 50.0, (5, 10, 3, 6))
     X_tgt_adapt = np.random.uniform(10.0, 50.0, (6, 10, 3, 6))
@@ -169,14 +202,15 @@ def test_18d_feature_scaling():
 
 if __name__ == "__main__":
     print("==================================================")
-    print("RUNNING HYBRIDONET-ADAPT HARDENED VERIFICATION")
+    print("RUNNING HYBRIDONET-ADAPT HARDENED VERIFICATION (7/7)")
     print("==================================================")
     test_linear_node_derivative()
     test_deterministic_attention_timestep()
     test_theta_gradient_flow()
+    test_rolling_window_rul_preprocessing()
     test_cell_level_disjoint_splitting()
-    test_robust_rul_scaling()
+    test_fixed_ceiling_rul_scaling()
     test_18d_feature_scaling()
     print("==================================================")
-    print("ALL 6/6 HARDENED TESTS PASSED SUCCESSFULLY")
+    print("ALL 7/7 HARDENED TESTS PASSED SUCCESSFULLY")
     print("==================================================")

@@ -58,21 +58,20 @@ class BatteryDataset(Dataset):
         return self.X[idx], self.Y[idx]
 
 
+DEFAULT_RUL_MAX_CEILING = 5000.0  # Fixed benchmark physical ceiling across all battery chemistries
+
+
 class RobustRULScaler:
     """
-    Physical upper-bound normalizer for battery Remaining Useful Life (RUL).
-    Normalizes RUL to [0, 1] using a global physical ceiling (e.g. max life across datasets).
-    Prevents out-of-distribution saturation against the Sigmoid predictor head.
+    Fixed physical upper-bound normalizer for battery Remaining Useful Life (RUL).
+    Normalizes RUL to [0, 1] using a fixed physical ceiling (default 5000 cycles).
+    Prevents out-of-distribution saturation against the Sigmoid predictor head across all datasets.
     """
-    def __init__(self, y_max: float = 3000.0):
-        self.y_max = max(1.0, float(y_max))
+    def __init__(self, y_max: float = DEFAULT_RUL_MAX_CEILING):
+        self.y_max = float(y_max)
 
-    def fit(self, Y_train: np.ndarray, Y_adapt: Optional[np.ndarray] = None):
-        max_seen = float(np.max(Y_train))
-        if Y_adapt is not None and len(Y_adapt) > 0:
-            max_seen = max(max_seen, float(np.max(Y_adapt)))
-        # Set ceiling at least 10% above max observed or 3000 cycles
-        self.y_max = max(3000.0, max_seen * 1.1)
+    def fit(self, Y_train: Optional[np.ndarray] = None, Y_adapt: Optional[np.ndarray] = None):
+        # Fixed physical ceiling - keeps normalization identical across source, adaptation, and blind test
         return self
 
     def transform(self, y: np.ndarray) -> np.ndarray:
@@ -92,11 +91,14 @@ def split_by_cell_id(
     """
     Splits samples strictly at the physical battery cell level.
     Guarantees that all observation windows for any given cell are assigned to ONLY ONE partition.
+    Raises ValueError if fewer than 2 unique physical cells are available.
     """
     unique_cells = np.unique(cell_ids)
-    if len(unique_cells) <= 1:
-        # Fallback for single-cell debug datasets
-        return train_test_split(X, Y, cell_ids, test_size=test_ratio, random_state=random_state)
+    if len(unique_cells) < 2:
+        raise ValueError(
+            f"Cell-level splitting requires at least 2 unique physical cells, but found {len(unique_cells)}. "
+            "Random window-level splitting is strictly forbidden because it causes intra-cell leakage."
+        )
 
     train_cells, test_cells = train_test_split(
         unique_cells, test_size=test_ratio, random_state=random_state
