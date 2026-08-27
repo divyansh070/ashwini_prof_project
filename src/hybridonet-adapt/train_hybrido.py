@@ -22,6 +22,8 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 import glob
 from typing import Tuple, Dict, List
+from sklearn.model_selection import KFold, train_test_split
+
 
 # Add directory and project root to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -62,48 +64,40 @@ def compute_dynamic_lambda(epoch: int, total_epochs: int, gamma: float = 10.0) -
     p = float(epoch) / float(max(1, total_epochs))
     return float(2.0 / (1.0 + np.exp(-gamma * p)) - 1.0)
 
-
 def fit_and_transform_features(
     X_train: np.ndarray,
     X_val: np.ndarray,
-    X_target: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
-    """
-    Dynamically fits a MinMaxScaler ONLY on X_train and applies to all splits.
-    Input shape: (N, 10, 3, 6) -> flattened to (N, 10, 18) for scaling.
-    """
+    X_tgt_adapt: np.ndarray,
+    X_tgt_test: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
+    """Dynamically fits MinMaxScaler ONLY on X_train."""
     n_tr, seq, ch, feat = X_train.shape
     X_tr_flat = X_train.reshape(n_tr, seq * ch * feat)
 
     scaler = MinMaxScaler(feature_range=(0.0, 1.0))
     X_tr_scaled = scaler.fit_transform(X_tr_flat).reshape(n_tr, seq, ch, feat)
 
-    n_val = X_val.shape[0]
-    X_val_flat = X_val.reshape(n_val, seq * ch * feat)
-    X_val_scaled = scaler.transform(X_val_flat).reshape(n_val, seq, ch, feat)
+    X_val_scaled = scaler.transform(X_val.reshape(X_val.shape[0], seq * ch * feat)).reshape(X_val.shape[0], seq, ch, feat)
+    X_tgt_adapt_scaled = scaler.transform(X_tgt_adapt.reshape(X_tgt_adapt.shape[0], seq * ch * feat)).reshape(X_tgt_adapt.shape[0], seq, ch, feat)
+    X_tgt_test_scaled = scaler.transform(X_tgt_test.reshape(X_tgt_test.shape[0], seq * ch * feat)).reshape(X_tgt_test.shape[0], seq, ch, feat)
 
-    n_tgt = X_target.shape[0]
-    X_tgt_flat = X_target.reshape(n_tgt, seq * ch * feat)
-    X_tgt_scaled = scaler.transform(X_tgt_flat).reshape(n_tgt, seq, ch, feat)
-
-    return X_tr_scaled, X_val_scaled, X_tgt_scaled, scaler
+    return X_tr_scaled, X_val_scaled, X_tgt_adapt_scaled, X_tgt_test_scaled, scaler
 
 
 def fit_and_transform_targets(
     Y_train: np.ndarray,
     Y_val: np.ndarray,
-    Y_target: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
-    """
-    Fits a target MinMaxScaler ONLY on Y_train to match Sigmoid activation [0, 1].
-    """
+    Y_tgt_adapt: np.ndarray,
+    Y_tgt_test: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
+    """Fits target MinMaxScaler ONLY on Y_train."""
     scaler_y = MinMaxScaler(feature_range=(0.0, 1.0))
     Y_tr_scaled = scaler_y.fit_transform(Y_train.reshape(-1, 1)).flatten()
     Y_val_scaled = scaler_y.transform(Y_val.reshape(-1, 1)).flatten()
-    Y_tgt_scaled = scaler_y.transform(Y_target.reshape(-1, 1)).flatten()
+    Y_tgt_adapt_scaled = scaler_y.transform(Y_tgt_adapt.reshape(-1, 1)).flatten()
+    Y_tgt_test_scaled = scaler_y.transform(Y_tgt_test.reshape(-1, 1)).flatten()
 
-    return Y_tr_scaled, Y_val_scaled, Y_tgt_scaled, scaler_y
-
+    return Y_tr_scaled, Y_val_scaled, Y_tgt_adapt_scaled, Y_tgt_test_scaled, scaler_y
 
 def train_single_fold(
     model: nn.Module,
@@ -214,7 +208,6 @@ def train_single_fold(
 
     return best_metrics
 
-
 def run_benchmark(
     source_npz: str,
     target_npz: str,
@@ -224,7 +217,6 @@ def run_benchmark(
     n_splits: int = 5,
     device: str = "cpu"
 ):
-    """Runs 5-fold cross-validation domain adaptation benchmark."""
     logger.info(f"Loading Source: {source_npz}")
     src_data = np.load(source_npz)
     X_src_raw, Y_src_raw = src_data["X"], src_data["Y"]
@@ -232,6 +224,11 @@ def run_benchmark(
     logger.info(f"Loading Target: {target_npz}")
     tgt_data = np.load(target_npz)
     X_tgt_raw, Y_tgt_raw = tgt_data["X"], tgt_data["Y"]
+
+    # [NEW] Split the target dataset: 60% for adaptation, 40% for blind testing
+    X_tgt_adapt, X_tgt_test, Y_tgt_adapt, Y_tgt_test = train_test_split(
+        X_tgt_raw, Y_tgt_raw, test_size=0.40, random_state=42
+    )
 
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     fold_results = []
@@ -241,14 +238,20 @@ def run_benchmark(
         X_tr_raw, X_val_raw = X_src_raw[train_idx], X_src_raw[val_idx]
         Y_tr_raw, Y_val_raw = Y_src_raw[train_idx], Y_src_raw[val_idx]
 
-        # 1. Zero-leakage dynamic scaling
-        X_tr_sc, X_val_sc, X_tgt_sc, scaler_x = fit_and_transform_features(X_tr_raw, X_val_raw, X_tgt_raw)
-        Y_tr_sc, Y_val_sc, Y_tgt_sc, scaler_y = fit_and_transform_targets(Y_tr_raw, Y_val_raw, Y_tgt_raw)
+        # 1. Zero-leakage dynamic scaling with the new target splits
+        X_tr_sc, X_val_sc, X_tgt_adapt_sc, X_tgt_test_sc, scaler_x = fit_and_transform_features(
+            X_tr_raw, X_val_raw, X_tgt_adapt, X_tgt_test
+        )
+        Y_tr_sc, Y_val_sc, Y_tgt_adapt_sc, Y_tgt_test_sc, scaler_y = fit_and_transform_targets(
+            Y_tr_raw, Y_val_raw, Y_tgt_adapt, Y_tgt_test
+        )
 
         src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(BatteryDataset(X_val_sc, Y_val_sc), batch_size=batch_size, shuffle=False)
-        tgt_loader = DataLoader(BatteryDataset(X_tgt_sc, Y_tgt_sc), batch_size=batch_size, shuffle=True)
-        tgt_test_loader = DataLoader(BatteryDataset(X_tgt_sc, Y_tgt_sc), batch_size=batch_size, shuffle=False)
+        
+        # [NEW] Separate loaders for adaptation (train) vs testing
+        tgt_loader = DataLoader(BatteryDataset(X_tgt_adapt_sc, Y_tgt_adapt_sc), batch_size=batch_size, shuffle=True)
+        tgt_test_loader = DataLoader(BatteryDataset(X_tgt_test_sc, Y_tgt_test_sc), batch_size=batch_size, shuffle=False)
 
         model = HybridoNetAdapt(
             input_dim=18,
@@ -264,7 +267,7 @@ def run_benchmark(
             target_loader=tgt_loader,
             val_loader=val_loader,
             target_test_loader=tgt_test_loader,
-            target_y_raw=Y_tgt_raw,
+            target_y_raw=Y_tgt_test, # [NEW] Pass only the unseen test labels for metrics
             scaler_y=scaler_y,
             epochs=epochs,
             lr=lr,

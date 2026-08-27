@@ -108,12 +108,15 @@ def test_dynamic_lambda_and_leakage_scaling():
     assert l_mid > l_start and l_end > l_mid, "Lambda must monotonically increase with progress"
     assert abs(l_end - 1.0) < 0.01, f"Expected lambda(1) ~ 1.0, got {l_end}"
 
-    # Scaling test
+    # Scaling test with separated adapt and test target splits
     X_tr = np.random.uniform(10.0, 50.0, (20, 10, 3, 6))
     X_val = np.random.uniform(10.0, 50.0, (5, 10, 3, 6))
-    X_tgt = np.random.uniform(10.0, 50.0, (10, 10, 3, 6))
+    X_tgt_adapt = np.random.uniform(10.0, 50.0, (6, 10, 3, 6))
+    X_tgt_test = np.random.uniform(10.0, 50.0, (4, 10, 3, 6))
 
-    X_tr_sc, X_val_sc, X_tgt_sc, scaler = fit_and_transform_features(X_tr, X_val, X_tgt)
+    X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler = fit_and_transform_features(
+        X_tr, X_val, X_tgt_adapt, X_tgt_test
+    )
     assert X_tr_sc.min() >= -1e-6 and X_tr_sc.max() <= 1.0 + 1e-6, f"Training features out of bounds: min={X_tr_sc.min()}, max={X_tr_sc.max()}"
     print("  -> Dynamic scheduling and zero-leakage scaling verified.")
 
