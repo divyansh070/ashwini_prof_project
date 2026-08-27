@@ -8,7 +8,7 @@ class ODEFunc(nn.Module):
     Derivative function dz/dt = f(z, t).
     Faithful to paper: f is realized as a single linear layer: dz/dt = W*z + b.
     """
-    def __init__(self, hidden_dim: int = 64):
+    def __init__(self, hidden_dim: int = 128):
         super().__init__()
         self.linear = nn.Linear(hidden_dim, hidden_dim)
 
@@ -22,7 +22,7 @@ class NeuralODEBlock(nn.Module):
     Integrates hidden state trajectory over continuous time using Runge-Kutta 4 (RK4).
     Evaluates at continuous integration step (t=2 / 2 integration steps).
     """
-    def __init__(self, hidden_dim: int = 64, num_steps: int = 2):
+    def __init__(self, hidden_dim: int = 128, num_steps: int = 2):
         super().__init__()
         self.ode_func = ODEFunc(hidden_dim)
         self.num_steps = num_steps
@@ -45,16 +45,16 @@ class NeuralODEBlock(nn.Module):
 
 class FeatureExtractor(nn.Module):
     """
-    HybridoNet-Adapt Feature Extractor (Tran et al., 2025):
-    1. 2-layer LSTM (input_dim=18 -> hidden_dim=64)
-    2. Multihead Attention (embed_dim=64)
-    3. Second-to-last attention timestep selection (h_{t=-2})
-    4. Neural ODE (NODE) continuous dynamics block
+    HybridoNet-Adapt Feature Extractor (Tran et al., 2025, Table 2):
+    1. 2-layer LSTM (input_dim=18 -> hidden_dim=128)
+    2. Multihead Attention (embed_dim=128)
+    3. Last attention timestep selection (h_{t=-1})
+    4. Neural ODE (NODE) continuous dynamics block (hidden_dim=128)
     """
     def __init__(
         self,
         input_dim: int = 18,
-        hidden_dim: int = 64,
+        hidden_dim: int = 128,
         num_lstm_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
@@ -63,7 +63,7 @@ class FeatureExtractor(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # 1. Two-layer LSTM
+        # 1. Two-layer LSTM (10x18 -> 10x128)
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
@@ -72,7 +72,7 @@ class FeatureExtractor(nn.Module):
             dropout=dropout if num_lstm_layers > 1 else 0.0
         )
 
-        # 2. Multihead Attention (Scaled Dot-Product)
+        # 2. Multihead Attention (Scaled Dot-Product, embed_dim=128)
         self.mha = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
@@ -81,40 +81,40 @@ class FeatureExtractor(nn.Module):
         )
         self.layer_norm = nn.LayerNorm(hidden_dim)
 
-        # 3. Modular Neural ODE Block
+        # 3. Modular Neural ODE Block (128 -> 128)
         self.node = ode_block if ode_block is not None else NeuralODEBlock(hidden_dim=hidden_dim, num_steps=2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Input x: (Batch, Seq_Len=10, Channels=3, Features=6) -> (Batch, 10, 18)
-        Output: Latent state z (Batch, 64)
+        Output: Latent state z (Batch, 128)
         """
         if x.dim() == 4:
             b, s, c, f = x.shape
             x = x.view(b, s, c * f)
 
-        # LSTM temporal feature encoding -> (B, S=10, 64)
+        # LSTM temporal feature encoding -> (B, S=10, 128)
         lstm_out, _ = self.lstm(x)
 
         # Multihead Attention with residual connection & LayerNorm
         attn_out, _ = self.mha(lstm_out, lstm_out, lstm_out)
-        h = self.layer_norm(lstm_out + attn_out)  # (B, S=10, 64)
+        h = self.layer_norm(lstm_out + attn_out)  # (B, S=10, 128)
 
-        # Paper-faithful: Select second-to-last attention timestep (-2)
-        h_selected = h[:, -2, :]  # (B, 64)
+        # Published paper: Output from Multihead Attention is taken from the last step along time dimension
+        h_selected = h[:, -1, :]  # (B, 128)
 
         # Continuous state evolution via Neural ODE
-        z = self.node(h_selected)  # (B, 64)
+        z = self.node(h_selected)  # (B, 128)
         return z
 
 
 class Predictor(nn.Module):
     """
-    RUL Predictor Network:
-    Three linear layers [128, 64, 32, 1] with BatchNorm1d, Dropout(0.1), ReLU,
+    RUL Predictor Network (Table 2):
+    Linear layers [128, 128, 64, 32, 1] with BatchNorm1d, Dropout(0.1), ReLU,
     ending strictly with Sigmoid() activation.
     """
-    def __init__(self, in_features: int = 64, dropout: float = 0.1):
+    def __init__(self, in_features: int = 128, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_features, 128),
@@ -151,14 +151,14 @@ class HybridoNetAdapt(nn.Module):
     def __init__(
         self,
         input_dim: int = 18,
-        hidden_dim: int = 64,
+        hidden_dim: int = 128,
         num_lstm_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
         ode_block: Optional[nn.Module] = None
     ):
         super().__init__()
-        # Shared Feature Extractor G_F
+        # Shared Feature Extractor G_F (128-D)
         self.feature_extractor = FeatureExtractor(
             input_dim=input_dim,
             hidden_dim=hidden_dim,
@@ -177,7 +177,7 @@ class HybridoNetAdapt(nn.Module):
         self.theta_t = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extracts 64-dimensional feature embeddings z."""
+        """Extracts 128-dimensional feature embeddings z."""
         return self.feature_extractor(x)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -4,12 +4,13 @@ HybridoNet-Adapt Training and Evaluation Pipeline (Tran et al., 2025).
 
 Implements:
 1. Strict Cell-Level Splitting: Zero intra-battery window leakage across train/validation/test partitions.
-2. Robust Physical RUL Normalization: Prevents Sigmoid head saturation when target battery life exceeds source life.
-3. Combined Objective: L_total = L_MSE(Source) + L_MSE(Target_Combined) + lambda(p) * L_MMD
-4. Exact Trainable Trade-Off Optimization: Target loss is MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target)
-5. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
-6. Scientific Validation: Model selection is driven strictly by validation loss. Blind test set is evaluated ONLY ONCE at the end.
-7. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
+2. Robust Physical RUL Normalization: Fixed 5000-cycle ceiling with strict error on overflow (no silent corruption).
+3. Published Architecture (Table 2): 128-D Feature Extractor (LSTM + MHA + NODE) and last attention timestep.
+4. Combined Objective: L_total = L_MSE(Source) + L_MSE(Target_Combined) + lambda(p) * L_MMD
+5. Exact Trainable Trade-Off Optimization: Target loss is MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target)
+6. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
+7. Scientific Validation: Model selection is driven strictly by validation loss. Blind test set is evaluated ONLY ONCE at the end.
+8. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
 """
 
 import os
@@ -65,17 +66,23 @@ class RobustRULScaler:
     """
     Fixed physical upper-bound normalizer for battery Remaining Useful Life (RUL).
     Normalizes RUL to [0, 1] using a fixed physical ceiling (default 5000 cycles).
-    Prevents out-of-distribution saturation against the Sigmoid predictor head across all datasets.
+    Raises ValueError loudly on overflow instead of silently clipping and corrupting labels.
     """
     def __init__(self, y_max: float = DEFAULT_RUL_MAX_CEILING):
         self.y_max = float(y_max)
 
     def fit(self, Y_train: Optional[np.ndarray] = None, Y_adapt: Optional[np.ndarray] = None):
-        # Fixed physical ceiling - keeps normalization identical across source, adaptation, and blind test
         return self
 
     def transform(self, y: np.ndarray) -> np.ndarray:
-        return np.clip(y / self.y_max, 0.0, 1.0).astype(np.float32)
+        scaled = y / self.y_max
+        if np.any(scaled < 0.0) or np.any(scaled > 1.0):
+            max_val = float(np.max(y))
+            raise ValueError(
+                f"RUL value ({max_val:.1f} cycles) exceeds the fixed benchmark ceiling of {self.y_max:.1f} cycles. "
+                "Failing loudly to prevent silent label corruption."
+            )
+        return scaled.astype(np.float32)
 
     def inverse_transform(self, y_scaled: np.ndarray) -> np.ndarray:
         return (y_scaled * self.y_max).astype(np.float32)
@@ -297,19 +304,27 @@ def run_benchmark(
     device: str = "cpu"
 ):
     """
-    Zero-Leakage Cell-Level Partitioned Benchmark Run:
+    Zero-Leakage Cell-Level Partitioned Benchmark Run (Table 2 Specs):
     Source: 90% Training Cells / 10% Validation Cells.
     Target: 60% Adaptation Cells / 40% Blind Testing Cells.
     """
     logger.info(f"Loading Source: {source_npz}")
     src_data = np.load(source_npz)
-    X_src_raw, Y_src_raw = src_data["X"], src_data["Y"]
-    src_cells = src_data["cell_ids"] if "cell_ids" in src_data else np.array([f"cell_{i}" for i in range(len(Y_src_raw))])
+    if "cell_ids" not in src_data:
+        raise ValueError(
+            f"Source dataset '{source_npz}' is missing 'cell_ids'. "
+            "Cell-level splitting cannot be guaranteed. Please re-run preprocess_hybrido.py."
+        )
+    X_src_raw, Y_src_raw, src_cells = src_data["X"], src_data["Y"], src_data["cell_ids"]
 
     logger.info(f"Loading Target: {target_npz}")
     tgt_data = np.load(target_npz)
-    X_tgt_raw, Y_tgt_raw = tgt_data["X"], tgt_data["Y"]
-    tgt_cells = tgt_data["cell_ids"] if "cell_ids" in tgt_data else np.array([f"cell_{i}" for i in range(len(Y_tgt_raw))])
+    if "cell_ids" not in tgt_data:
+        raise ValueError(
+            f"Target dataset '{target_npz}' is missing 'cell_ids'. "
+            "Cell-level splitting cannot be guaranteed. Please re-run preprocess_hybrido.py."
+        )
+    X_tgt_raw, Y_tgt_raw, tgt_cells = tgt_data["X"], tgt_data["Y"], tgt_data["cell_ids"]
 
     # 1. Zero-Leakage Cell-Level Splitting
     X_tr_raw, X_val_raw, Y_tr_raw, Y_val_raw, tr_c, val_c = split_by_cell_id(
@@ -328,20 +343,23 @@ def run_benchmark(
     )
 
     # 3. Robust Physical RUL Normalization (guarantees Y in [0, 1] without Sigmoid saturation)
-    scaler_y = RobustRULScaler().fit(Y_tr_raw, Y_tgt_adapt)
+    scaler_y = RobustRULScaler(y_max=DEFAULT_RUL_MAX_CEILING).fit()
     Y_tr_sc = scaler_y.transform(Y_tr_raw)
     Y_val_sc = scaler_y.transform(Y_val_raw)
     Y_tgt_ad_sc = scaler_y.transform(Y_tgt_adapt)
     Y_tgt_ts_sc = scaler_y.transform(Y_tgt_test)
 
-    src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True)
+    drop_src = len(X_tr_sc) > batch_size
+    drop_tgt = len(X_tgt_ad_sc) > batch_size
+    src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True, drop_last=drop_src)
     val_loader = DataLoader(BatteryDataset(X_val_sc, Y_val_sc), batch_size=batch_size, shuffle=False)
-    tgt_loader = DataLoader(BatteryDataset(X_tgt_ad_sc, Y_tgt_ad_sc), batch_size=batch_size, shuffle=True)
+    tgt_loader = DataLoader(BatteryDataset(X_tgt_ad_sc, Y_tgt_ad_sc), batch_size=batch_size, shuffle=True, drop_last=drop_tgt)
     tgt_test_loader = DataLoader(BatteryDataset(X_tgt_ts_sc, Y_tgt_ts_sc), batch_size=batch_size, shuffle=False)
 
+    # Model instantiation with published Table 2 dimensions (hidden_dim=128)
     model = HybridoNetAdapt(
         input_dim=18,
-        hidden_dim=64,
+        hidden_dim=128,
         num_lstm_layers=2,
         num_heads=4,
         dropout=0.1
