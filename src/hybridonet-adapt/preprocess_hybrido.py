@@ -189,9 +189,15 @@ def process_parquet_dataset(
 
         cycle_data = {}
         for cyc_num, group in cell_df.groupby("cycle_number"):
-            v = group["voltage"].values if "voltage" in group.columns else group.get("V", pd.Series()).values
-            i = group["current"].values if "current" in group.columns else group.get("I", pd.Series()).values
-            q = group["discharge_capacity"].values if "discharge_capacity" in group.columns else group.get("capacity", pd.Series()).values
+            def get_col(df_grp, candidates):
+                for c in candidates:
+                    if c in df_grp.columns:
+                        return df_grp[c].values
+                return np.array([])
+
+            v = get_col(group, ["voltage", "voltage_V", "Voltage", "V", "voltage_v"])
+            i = get_col(group, ["current", "current_A", "Current", "I", "current_a"])
+            q = get_col(group, ["discharge_capacity", "capacity", "capacity_Ah", "Discharge_Capacity", "Q", "Capacity"])
             cycle_data[int(cyc_num)] = {"voltage": v, "current": i, "capacity": q}
 
         tensors, ruls = extract_cell_samples(
