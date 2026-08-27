@@ -392,6 +392,18 @@ def run_benchmark(
     logger.info("="*50)
 
 
+def resolve_file_path(path_str: str) -> str:
+    """Resolves file path with case-insensitive fallback on Linux/Colab filesystems."""
+    if os.path.exists(path_str):
+        return path_str
+    dirname, basename = os.path.split(path_str)
+    if os.path.exists(dirname):
+        for f in os.listdir(dirname):
+            if f.lower() == basename.lower():
+                return os.path.join(dirname, f)
+    return path_str
+
+
 def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Benchmark Runner")
     parser.add_argument("--source", type=str, required=True, help="Path to source .npz raw features (REQUIRED)")
@@ -405,14 +417,17 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     logger.info(f"Using device: {device}")
 
-    if not os.path.exists(args.source):
+    src_path = resolve_file_path(args.source)
+    tgt_path = resolve_file_path(args.target)
+
+    if not os.path.exists(src_path):
         raise FileNotFoundError(f"Source feature file not found: {args.source}")
-    if not os.path.exists(args.target):
+    if not os.path.exists(tgt_path):
         raise FileNotFoundError(f"Target feature file not found: {args.target}")
 
     run_benchmark(
-        source_npz=args.source,
-        target_npz=args.target,
+        source_npz=src_path,
+        target_npz=tgt_path,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
