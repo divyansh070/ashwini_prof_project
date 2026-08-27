@@ -211,6 +211,32 @@ def process_parquet_dataset(
     return np.array(all_tensors, dtype=np.float32), np.array(all_ruls, dtype=np.float32), all_sample_ids, all_cell_ids
 
 
+def process_domain_parquet_files(
+    file_list: List[str],
+    domain_name: str,
+    window_size: int = 30,
+    stride: int = 30,
+    num_samples: int = 10,
+    rolling: bool = True
+) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
+    """Processes and bundles multiple parquet files belonging to the same dataset domain."""
+    all_X, all_Y, all_samples, all_cells = [], [], [], []
+    for p_file in file_list:
+        X, Y, sample_ids, cell_ids = process_parquet_dataset(
+            p_file, domain_name, window_size=window_size, stride=stride, num_samples=num_samples, rolling=rolling
+        )
+        if len(X) > 0:
+            all_X.append(X)
+            all_Y.append(Y)
+            all_samples.extend(sample_ids)
+            all_cells.extend(cell_ids)
+
+    if len(all_X) == 0:
+        return np.empty((0, num_samples, 3, 6)), np.empty((0,)), [], []
+
+    return np.concatenate(all_X, axis=0), np.concatenate(all_Y, axis=0), all_samples, all_cells
+
+
 def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Rolling RUL Preprocessing")
     parser.add_argument("--data-dir", type=str, default="data/real_processed", help="Directory containing processed battery parquets")
@@ -225,28 +251,57 @@ def main():
     rolling = not args.early_only
     logger.info(f"Extracting HybridoNet features (Rolling RUL mode: {rolling}, Window: {args.window_size}, Stride: {args.stride})...")
 
-    parquet_files = glob.glob(os.path.join(args.data_dir, "*.parquet"))
-    if not parquet_files:
-        parquet_files = glob.glob("data/**/*.parquet", recursive=True)
+    domains_processed = set()
 
-    for p_file in parquet_files:
-        domain = os.path.splitext(os.path.basename(p_file))[0]
-        X, Y, sample_ids, cell_ids = process_parquet_dataset(
-            p_file, domain, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
-        )
-        if len(X) > 0:
-            out_file = os.path.join(args.output_dir, f"{domain}_raw_features.npz")
-            np.savez_compressed(
-                out_file,
-                X=X,                     # (N_samples, 10, 3, 6) - RAW UNSCALED
-                Y=Y,                     # (N_samples,) - TRUE RUL (EOL - current_cycle)
-                sample_ids=np.array(sample_ids),
-                cell_ids=np.array(cell_ids) # Battery-level grouping for zero-leakage splits
-            )
-            n_cells = len(np.unique(cell_ids))
-            logger.info(f"Saved {domain}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
+    # 1. Discover domain subdirectories (e.g. data/real_processed/Stanford/, data/real_processed/HUST/)
+    if os.path.exists(args.data_dir):
+        subdirs = [d for d in os.listdir(args.data_dir) if os.path.isdir(os.path.join(args.data_dir, d))]
+        for d in subdirs:
+            domain_path = os.path.join(args.data_dir, d)
+            parquets = glob.glob(os.path.join(domain_path, "*.parquet"))
+            if parquets:
+                X, Y, s_ids, c_ids = process_domain_parquet_files(
+                    parquets, d, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
+                )
+                if len(X) > 0:
+                    out_file = os.path.join(args.output_dir, f"{d}_raw_features.npz")
+                    np.savez_compressed(
+                        out_file,
+                        X=X,
+                        Y=Y,
+                        sample_ids=np.array(s_ids),
+                        cell_ids=np.array(c_ids)
+                    )
+                    n_cells = len(np.unique(c_ids))
+                    logger.info(f"Saved {d}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
+                    domains_processed.add(d)
 
-    logger.info("Raw feature extraction completed with zero global scaling leakage.")
+    # 2. Discover top-level parquet files (e.g. data/real_processed/Stanford.parquet)
+    if os.path.exists(args.data_dir):
+        top_parquets = glob.glob(os.path.join(args.data_dir, "*.parquet"))
+        for p_file in top_parquets:
+            domain = os.path.splitext(os.path.basename(p_file))[0]
+            if domain not in domains_processed:
+                X, Y, s_ids, c_ids = process_parquet_dataset(
+                    p_file, domain, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
+                )
+                if len(X) > 0:
+                    out_file = os.path.join(args.output_dir, f"{domain}_raw_features.npz")
+                    np.savez_compressed(
+                        out_file,
+                        X=X,
+                        Y=Y,
+                        sample_ids=np.array(s_ids),
+                        cell_ids=np.array(c_ids)
+                    )
+                    n_cells = len(np.unique(c_ids))
+                    logger.info(f"Saved {domain}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
+                    domains_processed.add(domain)
+
+    if not domains_processed:
+        logger.warning(f"No battery parquet datasets found in {args.data_dir}. Please run dataset downloader first.")
+    else:
+        logger.info("Raw feature extraction completed with zero global scaling leakage.")
 
 
 if __name__ == "__main__":

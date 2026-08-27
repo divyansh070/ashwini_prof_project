@@ -36,10 +36,11 @@ np.random.seed(SEED)
 ZENODO_BASE_URL = "https://zenodo.org/api/records/14969822/files/{dataset}.zip/content"
 
 DATASETS_TO_DOWNLOAD = {
-    "CALCE": "NMC", # Assuming mostly NMC/LCO, label as NMC for preprocessing bounds
-    "HUST": "LFP",
-    "SNL": "NMC",   # SNL has mixed, we'll use NMC bounds as safe default
-    "RWTH": "NMC"
+    "Stanford": "LFP", # Severson et al. 2019 / TRI fast-charging benchmark
+    "CALCE": "NMC",    # CALCE NMC/LCO cells
+    "HUST": "LFP",     # HUST LFP varied discharge benchmark
+    "SNL": "NMC",      # SNL mixed cells
+    "RWTH": "NMC"      # RWTH NMC cells
 }
 
 def check_for_synthetic_data(voltage_array):
