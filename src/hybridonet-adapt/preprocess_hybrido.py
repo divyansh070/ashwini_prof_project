@@ -5,9 +5,9 @@ HybridoNet-Adapt Feature Preprocessing Pipeline (Tran et al., 2025).
 Exact methodology:
 1. Signal Filtering: 1D median filter (kernel=3) on Voltage (V), Current (I), and Capacity (Q) per cycle.
 2. Statistical Extraction: 6 features (Mean, Std, Min, Max, Var, Median) for each of the 3 signals -> 18 features/cycle.
-3. Observation Window: 30-cycle sliding window, uniformly sampling 10 cycles.
+3. Observation Window: 30-cycle observation window, uniformly sampling 10 cycles.
 4. Target Formulation: RUL = EOL - current_cycle (historical-data-independent RUL prediction).
-5. Data Leakage Prevention: Saves RAW unscaled feature tensors. Feature & target scalers are fitted ONLY on training splits in train_hybrido.py.
+5. Data Leakage Prevention: Saves RAW unscaled feature tensors and individual cell_ids for strict cell-level splitting.
 """
 
 import os
@@ -83,7 +83,7 @@ def extract_window_tensor(
     if len(window_cycles) < num_samples:
         return None
 
-    # Uniform 10-cycle sampling
+    # Uniform 10-cycle sampling across the 30-cycle window
     idx_uniform = np.linspace(0, len(window_cycles) - 1, num_samples, dtype=int)
     selected_cycles = [window_cycles[i] for i in idx_uniform]
 
@@ -110,7 +110,7 @@ def extract_cell_samples(
 ) -> Tuple[List[np.ndarray], List[float]]:
     """
     Extracts 10x3x6 tensors and true RUL targets (RUL = EOL - current_cycle).
-    If rolling=True: extracts multiple 30-cycle sliding windows throughout cell life.
+    If rolling=True: extracts multiple 30-cycle observation windows (stride=30 gives non-overlapping rolling windows, stride<30 gives sliding windows).
     If rolling=False: extracts only the first 30-cycle window (RUL = EOL - 30).
     """
     available_cycles = sorted([c for c in cycle_data.keys() if c > 0])
@@ -131,12 +131,11 @@ def extract_cell_samples(
         return samples, ruls
 
     # Rolling windows [t-window_size+1 .. t]
-    max_cyc = available_cycles[-1]
     for end_idx in range(window_size, len(available_cycles) + 1, stride):
         window = available_cycles[end_idx - window_size:end_idx]
         current_cycle = window[-1]
         
-        # Stop window extraction if we have exceeded 80% of EOL (standard RUL evaluation convention)
+        # Stop window extraction once current cycle reaches or exceeds EOL (current_cycle >= eol)
         if current_cycle >= eol:
             break
 
@@ -156,22 +155,28 @@ def process_parquet_dataset(
     stride: int = 30,
     num_samples: int = 10,
     rolling: bool = True
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
     """
-    Processes standardized battery parquets and extracts raw unscaled feature tensors + RUL labels.
+    Processes standardized battery parquets and extracts raw unscaled feature tensors + RUL labels + cell IDs.
+    Returns:
+        X: (N, 10, 3, 6)
+        Y: (N,)
+        sample_ids: List of window-level identifiers
+        cell_ids: List of battery-level cell identifiers (for cell-level grouping)
     """
     if not os.path.exists(parquet_path):
         logger.warning(f"File not found: {parquet_path}")
-        return np.empty((0, num_samples, 3, 6)), np.empty((0,)), []
+        return np.empty((0, num_samples, 3, 6)), np.empty((0,)), [], []
 
     df = pd.read_parquet(parquet_path)
-    cell_ids = df["cell_id"].unique()
+    cell_unique = df["cell_id"].unique()
     
     all_tensors = []
     all_ruls = []
     all_sample_ids = []
+    all_cell_ids = []
 
-    for cid in cell_ids:
+    for cid in cell_unique:
         cell_df = df[df["cell_id"] == cid]
         
         # Determine cell End of Life (EOL)
@@ -193,15 +198,17 @@ def process_parquet_dataset(
             cycle_data, eol, window_size=window_size, stride=stride, num_samples=num_samples, rolling=rolling
         )
 
+        cell_global_id = f"{domain_name}_{cid}"
         for s_idx, (t_mat, r_val) in enumerate(zip(tensors, ruls)):
             all_tensors.append(t_mat)
             all_ruls.append(r_val)
-            all_sample_ids.append(f"{domain_name}_{cid}_w{s_idx}")
+            all_sample_ids.append(f"{cell_global_id}_w{s_idx}")
+            all_cell_ids.append(cell_global_id)
 
     if len(all_tensors) == 0:
-        return np.empty((0, num_samples, 3, 6)), np.empty((0,)), []
+        return np.empty((0, num_samples, 3, 6)), np.empty((0,)), [], []
 
-    return np.array(all_tensors, dtype=np.float32), np.array(all_ruls, dtype=np.float32), all_sample_ids
+    return np.array(all_tensors, dtype=np.float32), np.array(all_ruls, dtype=np.float32), all_sample_ids, all_cell_ids
 
 
 def main():
@@ -209,7 +216,7 @@ def main():
     parser.add_argument("--data-dir", type=str, default="data/real_processed", help="Directory containing processed battery parquets")
     parser.add_argument("--output-dir", type=str, default="data/hybridonet/processed", help="Output directory for raw unscaled tensors")
     parser.add_argument("--window-size", type=int, default=30, help="Observation window size (cycles)")
-    parser.add_argument("--stride", type=int, default=30, help="Window stride for rolling RUL samples")
+    parser.add_argument("--stride", type=int, default=30, help="Window stride for rolling RUL samples (30=non-overlapping)")
     parser.add_argument("--num-samples", type=int, default=10, help="Uniformly sampled cycles in window")
     parser.add_argument("--early-only", action="store_true", help="Extract only early-cycle (first window) rather than full rolling RUL")
     args = parser.parse_args()
@@ -224,18 +231,20 @@ def main():
 
     for p_file in parquet_files:
         domain = os.path.splitext(os.path.basename(p_file))[0]
-        X, Y, sample_ids = process_parquet_dataset(
+        X, Y, sample_ids, cell_ids = process_parquet_dataset(
             p_file, domain, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
         )
         if len(X) > 0:
             out_file = os.path.join(args.output_dir, f"{domain}_raw_features.npz")
             np.savez_compressed(
                 out_file,
-                X=X, # (N_samples, 10, 3, 6) - RAW UNSCALED
-                Y=Y, # (N_samples,) - TRUE RUL (EOL - current_cycle)
-                sample_ids=np.array(sample_ids)
+                X=X,                     # (N_samples, 10, 3, 6) - RAW UNSCALED
+                Y=Y,                     # (N_samples,) - TRUE RUL (EOL - current_cycle)
+                sample_ids=np.array(sample_ids),
+                cell_ids=np.array(cell_ids) # Battery-level grouping for zero-leakage splits
             )
-            logger.info(f"Saved {domain}: {len(X)} samples, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
+            n_cells = len(np.unique(cell_ids))
+            logger.info(f"Saved {domain}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
 
     logger.info("Raw feature extraction completed with zero global scaling leakage.")
 

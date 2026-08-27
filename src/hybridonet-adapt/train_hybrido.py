@@ -3,11 +3,13 @@
 HybridoNet-Adapt Training and Evaluation Pipeline (Tran et al., 2025).
 
 Implements:
-1. Combined Objective: L_total = L_MSE(Source) + L_MSE(Target_Combined) + lambda(p) * L_MMD
-2. Exact Trainable Trade-Off Optimization: Target loss is MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target)
-3. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
-4. Scientific Validation: Model selection is driven strictly by validation loss. Test set is evaluated ONLY ONCE at the end.
-5. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
+1. Strict Cell-Level Splitting: Zero intra-battery window leakage across train/validation/test partitions.
+2. Robust Physical RUL Normalization: Prevents Sigmoid head saturation when target battery life exceeds source life.
+3. Combined Objective: L_total = L_MSE(Source) + L_MSE(Target_Combined) + lambda(p) * L_MMD
+4. Exact Trainable Trade-Off Optimization: Target loss is MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target)
+5. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
+6. Scientific Validation: Model selection is driven strictly by validation loss. Blind test set is evaluated ONLY ONCE at the end.
+7. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
 """
 
 import os
@@ -24,7 +26,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
 import glob
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Optional
 
 # Add directory and project root to path
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -56,6 +58,62 @@ class BatteryDataset(Dataset):
         return self.X[idx], self.Y[idx]
 
 
+class RobustRULScaler:
+    """
+    Physical upper-bound normalizer for battery Remaining Useful Life (RUL).
+    Normalizes RUL to [0, 1] using a global physical ceiling (e.g. max life across datasets).
+    Prevents out-of-distribution saturation against the Sigmoid predictor head.
+    """
+    def __init__(self, y_max: float = 3000.0):
+        self.y_max = max(1.0, float(y_max))
+
+    def fit(self, Y_train: np.ndarray, Y_adapt: Optional[np.ndarray] = None):
+        max_seen = float(np.max(Y_train))
+        if Y_adapt is not None and len(Y_adapt) > 0:
+            max_seen = max(max_seen, float(np.max(Y_adapt)))
+        # Set ceiling at least 10% above max observed or 3000 cycles
+        self.y_max = max(3000.0, max_seen * 1.1)
+        return self
+
+    def transform(self, y: np.ndarray) -> np.ndarray:
+        return np.clip(y / self.y_max, 0.0, 1.0).astype(np.float32)
+
+    def inverse_transform(self, y_scaled: np.ndarray) -> np.ndarray:
+        return (y_scaled * self.y_max).astype(np.float32)
+
+
+def split_by_cell_id(
+    X: np.ndarray,
+    Y: np.ndarray,
+    cell_ids: np.ndarray,
+    test_ratio: float = 0.10,
+    random_state: int = 42
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Splits samples strictly at the physical battery cell level.
+    Guarantees that all observation windows for any given cell are assigned to ONLY ONE partition.
+    """
+    unique_cells = np.unique(cell_ids)
+    if len(unique_cells) <= 1:
+        # Fallback for single-cell debug datasets
+        return train_test_split(X, Y, cell_ids, test_size=test_ratio, random_state=random_state)
+
+    train_cells, test_cells = train_test_split(
+        unique_cells, test_size=test_ratio, random_state=random_state
+    )
+
+    train_mask = np.isin(cell_ids, train_cells)
+    test_mask = np.isin(cell_ids, test_cells)
+
+    assert set(train_cells).isdisjoint(set(test_cells)), "Cell overlap detected between partitions!"
+
+    return (
+        X[train_mask], X[test_mask],
+        Y[train_mask], Y[test_mask],
+        cell_ids[train_mask], cell_ids[test_mask]
+    )
+
+
 def compute_dynamic_lambda(epoch: int, total_epochs: int, gamma: float = 10.0) -> float:
     """
     Computes dynamic lambda scheduling:
@@ -74,7 +132,7 @@ def fit_and_transform_features_18d(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
     """
     Fits MinMaxScaler across all samples and time steps over the 18 physical feature dimensions.
-    X shape: (N, 10, 3, 6) -> (N, 10, 18) -> reshape(-1, 18) for scaling.
+    X shape: (N, 10, 3, 6) -> (N*10, 18) for scaling.
     """
     def to_flat18(arr):
         n, s, c, f = arr.shape
@@ -96,22 +154,6 @@ def fit_and_transform_features_18d(
     return X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler
 
 
-def fit_and_transform_targets(
-    Y_train: np.ndarray,
-    Y_val: np.ndarray,
-    Y_tgt_adapt: np.ndarray,
-    Y_tgt_test: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MinMaxScaler]:
-    """Fits target MinMaxScaler ONLY on Y_train to match Sigmoid activation [0, 1]."""
-    scaler_y = MinMaxScaler(feature_range=(0.0, 1.0))
-    Y_tr_scaled = scaler_y.fit_transform(Y_train.reshape(-1, 1)).flatten()
-    Y_val_scaled = scaler_y.transform(Y_val.reshape(-1, 1)).flatten()
-    Y_tgt_adapt_scaled = scaler_y.transform(Y_tgt_adapt.reshape(-1, 1)).flatten()
-    Y_tgt_test_scaled = scaler_y.transform(Y_tgt_test.reshape(-1, 1)).flatten()
-
-    return Y_tr_scaled, Y_val_scaled, Y_tgt_adapt_scaled, Y_tgt_test_scaled, scaler_y
-
-
 def train_hybrido_session(
     model: nn.Module,
     source_loader: DataLoader,
@@ -120,7 +162,7 @@ def train_hybrido_session(
     target_test_loader: DataLoader,
     target_y_test_raw: np.ndarray,
     val_y_raw: np.ndarray,
-    scaler_y: MinMaxScaler,
+    scaler_y: RobustRULScaler,
     epochs: int = 10,
     lr: float = 0.0005,
     sigma_mmd: float = 1.0,
@@ -168,7 +210,6 @@ def train_hybrido_session(
 
             # 2. Target forward pass -> predicts combined Y_hat_T = theta_s * y_s + theta_t * y_t
             y_comb_t, _, _, z_t = model(tgt_x)
-            # CRITICAL FIX: Target loss is evaluated on combined output so theta_s, theta_t are actively trained!
             loss_target = criterion_mse(y_comb_t, tgt_y)
 
             # 3. Maximum Mean Discrepancy (MMD) Loss between feature representations
@@ -195,8 +236,8 @@ def train_hybrido_session(
                 _, y_pred_s, _, _ = model(v_x)
                 val_preds.extend(y_pred_s.cpu().numpy().flatten())
 
-        val_preds = np.array(val_preds).reshape(-1, 1)
-        val_preds_unscaled = scaler_y.inverse_transform(val_preds).flatten()
+        val_preds = np.array(val_preds)
+        val_preds_unscaled = scaler_y.inverse_transform(val_preds)
         val_rmse = float(np.sqrt(mean_squared_error(val_y_raw, val_preds_unscaled)))
 
         if val_rmse < best_val_rmse:
@@ -214,7 +255,7 @@ def train_hybrido_session(
             f"theta_S: {model.theta_s.item():.3f}, theta_T: {model.theta_t.item():.3f}"
         )
 
-    # FINAL STEP: Load best model chosen by validation and evaluate test set EXACTLY ONCE
+    # FINAL EVALUATION: Load best checkpoint chosen by validation, test target set EXACTLY ONCE
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
 
@@ -226,8 +267,8 @@ def train_hybrido_session(
             y_comb_t, _, _, _ = model(t_x)
             test_preds.extend(y_comb_t.cpu().numpy().flatten())
 
-    test_preds = np.array(test_preds).reshape(-1, 1)
-    test_preds_unscaled = scaler_y.inverse_transform(test_preds).flatten()
+    test_preds = np.array(test_preds)
+    test_preds_unscaled = scaler_y.inverse_transform(test_preds)
 
     final_test_rmse = float(np.sqrt(mean_squared_error(target_y_test_raw, test_preds_unscaled)))
     final_test_mape = float(mean_absolute_percentage_error(target_y_test_raw, test_preds_unscaled) * 100.0)
@@ -254,35 +295,42 @@ def run_benchmark(
     device: str = "cpu"
 ):
     """
-    Paper-faithful benchmark run:
-    90% Source Training / 10% Source Validation.
-    60% Target Adaptation / 40% Target Blind Testing.
+    Zero-Leakage Cell-Level Partitioned Benchmark Run:
+    Source: 90% Training Cells / 10% Validation Cells.
+    Target: 60% Adaptation Cells / 40% Blind Testing Cells.
     """
     logger.info(f"Loading Source: {source_npz}")
     src_data = np.load(source_npz)
     X_src_raw, Y_src_raw = src_data["X"], src_data["Y"]
+    src_cells = src_data["cell_ids"] if "cell_ids" in src_data else np.array([f"cell_{i}" for i in range(len(Y_src_raw))])
 
     logger.info(f"Loading Target: {target_npz}")
     tgt_data = np.load(target_npz)
     X_tgt_raw, Y_tgt_raw = tgt_data["X"], tgt_data["Y"]
+    tgt_cells = tgt_data["cell_ids"] if "cell_ids" in tgt_data else np.array([f"cell_{i}" for i in range(len(Y_tgt_raw))])
 
-    # 1. 90/10 Source train/val split (paper protocol)
-    X_tr_raw, X_val_raw, Y_tr_raw, Y_val_raw = train_test_split(
-        X_src_raw, Y_src_raw, test_size=val_ratio, random_state=42
+    # 1. Zero-Leakage Cell-Level Splitting
+    X_tr_raw, X_val_raw, Y_tr_raw, Y_val_raw, tr_c, val_c = split_by_cell_id(
+        X_src_raw, Y_src_raw, src_cells, test_ratio=val_ratio, random_state=42
+    )
+    X_tgt_adapt, X_tgt_test, Y_tgt_adapt, Y_tgt_test, ad_c, ts_c = split_by_cell_id(
+        X_tgt_raw, Y_tgt_raw, tgt_cells, test_ratio=0.40, random_state=42
     )
 
-    # 2. Target adaptation (train) vs blind test split
-    X_tgt_adapt, X_tgt_test, Y_tgt_adapt, Y_tgt_test = train_test_split(
-        X_tgt_raw, Y_tgt_raw, test_size=0.40, random_state=42
-    )
+    logger.info(f"Source Cells: {len(np.unique(tr_c))} train, {len(np.unique(val_c))} val")
+    logger.info(f"Target Cells: {len(np.unique(ad_c))} adapt, {len(np.unique(ts_c))} blind test")
 
-    # 3. 18-D Feature and target scaling
+    # 2. 18-D Feature Scaling across samples and time steps
     X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler_x = fit_and_transform_features_18d(
         X_tr_raw, X_val_raw, X_tgt_adapt, X_tgt_test
     )
-    Y_tr_sc, Y_val_sc, Y_tgt_ad_sc, Y_tgt_ts_sc, scaler_y = fit_and_transform_targets(
-        Y_tr_raw, Y_val_raw, Y_tgt_adapt, Y_tgt_test
-    )
+
+    # 3. Robust Physical RUL Normalization (guarantees Y in [0, 1] without Sigmoid saturation)
+    scaler_y = RobustRULScaler().fit(Y_tr_raw, Y_tgt_adapt)
+    Y_tr_sc = scaler_y.transform(Y_tr_raw)
+    Y_val_sc = scaler_y.transform(Y_val_raw)
+    Y_tgt_ad_sc = scaler_y.transform(Y_tgt_adapt)
+    Y_tgt_ts_sc = scaler_y.transform(Y_tgt_test)
 
     src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(BatteryDataset(X_val_sc, Y_val_sc), batch_size=batch_size, shuffle=False)
