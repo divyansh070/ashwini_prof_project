@@ -113,8 +113,10 @@ def download_stanford_lfp(raw_dir: str, proc_dir: str):
         below = cycle_caps[cycle_caps < threshold]
         cycle_life = int(below.index[0]) if len(below) > 0 else int(cycle_caps.index[-1])
 
-        # Extract only discharge data from early cycles (10 to 100, step 2)
-        for cyc in range(10, 101, 2):
+        # Extract all available discharge cycles up to cycle_life
+        for cyc in sorted(df["cycle_number"].unique()):
+            if cyc > cycle_life:
+                break
             cyc_df = df[(df["cycle_number"] == cyc) & (df["current_A"] < -0.01)]
             if len(cyc_df) < 5:
                 continue

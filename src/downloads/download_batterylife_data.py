@@ -123,10 +123,10 @@ def process_pkl_data(pkl_data, parquet_path, dataset_name, chemistry, filename):
             cycle_life = cyc
             break
             
-    # Extract early cycles (e.g., 10 to 100 step 2) for Koopman
-    for cyc in range(10, 101, 2):
-        if cyc not in cycle_data:
-            continue
+    # Extract all available discharge cycles up to EOL across the cell aging lifetime
+    for cyc in cycle_nums_available:
+        if cyc > cycle_life:
+            break
             
         cyc_dict = cycle_data[cyc]
         if 'voltage_in_V' not in cyc_dict or 'current_in_A' not in cyc_dict or 'discharge_capacity_in_Ah' not in cyc_dict:
