@@ -8,6 +8,13 @@ Exact methodology:
 3. Observation Window: 30-cycle observation window, uniformly sampling 10 cycles.
 4. Target Formulation: RUL = EOL - current_cycle (historical-data-independent RUL prediction).
 5. Data Leakage Prevention: Saves RAW unscaled feature tensors and individual cell_ids for strict cell-level splitting.
+
+ACCURACY IMPROVEMENT: the default --stride was lowered from 30 (non-overlapping windows) to 10
+(overlapping windows). This multiplies the number of training samples extracted per cell roughly
+3x with no additional leakage risk, since the leakage safeguard in train_hybrido.py operates at the
+physical cell level, not the window level -- overlapping windows from the same cell are still
+guaranteed to land entirely in one split. Pass --stride 30 to reproduce the original non-overlapping
+behavior if you need exact paper parity.
 """
 
 import os
@@ -47,6 +54,7 @@ def compute_cycle_statistics(
     """
     Computes 6 statistical features for Voltage, Current, Capacity after median filtering.
     Features: [Mean, Std, Min, Max, Variance, Median]
+
     Returns:
         feature_matrix: Shape (3, 6) -> 18 features
     """
@@ -57,14 +65,12 @@ def compute_cycle_statistics(
         if len(sig) == 0:
             continue
         clean_sig = medfilt(sig, kernel_size=filter_kernel)
-        
         mean_val = float(np.mean(clean_sig))
         std_val = float(np.std(clean_sig))
         min_val = float(np.min(clean_sig))
         max_val = float(np.max(clean_sig))
         var_val = float(np.var(clean_sig))
         med_val = float(np.median(clean_sig))
-
         feature_matrix[i] = [mean_val, std_val, min_val, max_val, var_val, med_val]
 
     return feature_matrix
@@ -77,6 +83,7 @@ def extract_window_tensor(
 ) -> Optional[np.ndarray]:
     """
     Uniformly samples `num_samples` (10) cycles from a list of window cycles (e.g. 30 cycles).
+
     Returns:
         tensor: Shape (10, 3, 6)
     """
@@ -93,7 +100,6 @@ def extract_window_tensor(
         v = np.array(c_dict.get("voltage", c_dict.get("V", [])))
         i = np.array(c_dict.get("current", c_dict.get("I", [])))
         q = np.array(c_dict.get("capacity", c_dict.get("Q", c_dict.get("Qd", []))))
-
         feat_3x6 = compute_cycle_statistics(v, i, q)
         cell_tensor[step_idx] = feat_3x6
 
@@ -110,7 +116,8 @@ def extract_cell_samples(
 ) -> Tuple[List[np.ndarray], List[float]]:
     """
     Extracts 10x3x6 tensors and true RUL targets (RUL = EOL - current_cycle).
-    If rolling=True: extracts multiple 30-cycle observation windows (stride=30 gives non-overlapping rolling windows, stride<30 gives sliding windows).
+    If rolling=True: extracts multiple 30-cycle observation windows (stride=30 gives non-overlapping
+    rolling windows, stride<30 gives overlapping/sliding windows -- more training samples per cell).
     If rolling=False: extracts only the first 30-cycle window (RUL = EOL - 30).
     """
     available_cycles = sorted([c for c in cycle_data.keys() if c > 0])
@@ -134,7 +141,7 @@ def extract_cell_samples(
     for end_idx in range(window_size, len(available_cycles) + 1, stride):
         window = available_cycles[end_idx - window_size:end_idx]
         current_cycle = window[-1]
-        
+
         # Stop window extraction once current cycle reaches or exceeds EOL (current_cycle >= eol)
         if current_cycle >= eol:
             break
@@ -158,6 +165,7 @@ def process_parquet_dataset(
 ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
     """
     Processes standardized battery parquets and extracts raw unscaled feature tensors + RUL labels + cell IDs.
+
     Returns:
         X: (N, 10, 3, 6)
         Y: (N,)
@@ -170,7 +178,7 @@ def process_parquet_dataset(
 
     df = pd.read_parquet(parquet_path)
     cell_unique = df["cell_id"].unique()
-    
+
     all_tensors = []
     all_ruls = []
     all_sample_ids = []
@@ -178,7 +186,7 @@ def process_parquet_dataset(
 
     for cid in cell_unique:
         cell_df = df[df["cell_id"] == cid]
-        
+
         # Determine cell End of Life (EOL)
         if "cycle_life" in cell_df.columns and not cell_df["cycle_life"].isna().all():
             eol = float(cell_df["cycle_life"].dropna().iloc[0])
@@ -227,6 +235,7 @@ def process_domain_parquet_files(
 ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
     """Processes and bundles multiple parquet files belonging to the same dataset domain."""
     all_X, all_Y, all_samples, all_cells = [], [], [], []
+
     for p_file in file_list:
         X, Y, sample_ids, cell_ids = process_parquet_dataset(
             p_file, domain_name, window_size=window_size, stride=stride, num_samples=num_samples, rolling=rolling
@@ -248,14 +257,20 @@ def main():
     parser.add_argument("--data-dir", type=str, default="data/real_processed", help="Directory containing processed battery parquets")
     parser.add_argument("--output-dir", type=str, default="data/hybridonet/processed", help="Output directory for raw unscaled tensors")
     parser.add_argument("--window-size", type=int, default=30, help="Observation window size (cycles)")
-    parser.add_argument("--stride", type=int, default=30, help="Window stride for rolling RUL samples (30=non-overlapping)")
+    parser.add_argument("--stride", type=int, default=10, help="Window stride for rolling RUL samples (default=10, overlapping windows for more training data; use 30 for the original non-overlapping paper setup)")
     parser.add_argument("--num-samples", type=int, default=10, help="Uniformly sampled cycles in window")
     parser.add_argument("--early-only", action="store_true", help="Extract only early-cycle (first window) rather than full rolling RUL")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     rolling = not args.early_only
+
     logger.info(f"Extracting HybridoNet features (Rolling RUL mode: {rolling}, Window: {args.window_size}, Stride: {args.stride})...")
+    if rolling and args.stride >= args.window_size:
+        logger.info(
+            f"Note: stride ({args.stride}) >= window size ({args.window_size}) produces non-overlapping "
+            "windows. Use a smaller --stride for more (overlapping) training samples per cell."
+        )
 
     domains_processed = set()
 

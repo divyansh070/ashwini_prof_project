@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 HybridoNet-Adapt Comprehensive Verification Test Suite (8/8 Tests).
+
 Validates:
 1. Linear NODE Derivative (dh/dt = Wh + b, Table 2 hidden=128)
 2. Deterministic Multihead Attention Last Timestep Selection (index -1)
-3. Active Gradient Flow on Trade-Off Parameters (theta_s, theta_t)
+3. Constrained Trade-Off Parameters: Gradient Flow AND theta_s + theta_t == 1 (softmax parameterization)
 4. Rolling Window RUL Formulation (RUL = EOL - current_cycle)
 5. Zero Intra-Battery Leakage: Cell-Level Group Splitting & ValueError on Single Cell
 6. Fixed Physical RUL Normalization Ceiling (5000 cyc) & ValueError on Overflow
@@ -55,18 +56,19 @@ def test_linear_node_derivative():
     h_in = torch.randn(8, 128, requires_grad=True)
     h_out = node(h_in)
     assert h_out.shape == (8, 128), f"Expected (8, 128), got {h_out.shape}"
+
     h_out.sum().backward()
     assert h_in.grad is not None, "Gradients failed to flow through linear NODE"
-    print("  -> Linear NODE test passed: Single linear layer derivative (128-D) verified.")
+    print(" -> Linear NODE test passed: Single linear layer derivative (128-D) verified.")
 
 
 def test_deterministic_attention_timestep():
     print("[TEST 2/8] Testing Deterministic Multihead Attention Last Timestep (-1) Selection...")
     feat_ext = FeatureExtractor(input_dim=18, hidden_dim=128, num_lstm_layers=2, num_heads=4, dropout=0.0)
-    
+
     # Create input tensor where step index -1 (i.e. index 9 out of 10) has a distinct marker
     x = torch.zeros(2, 10, 3, 6)
-    x[:, 9, :, :] = 10.0 # Distinct marker on last timestep index 9
+    x[:, 9, :, :] = 10.0  # Distinct marker on last timestep index 9
 
     identity_node = nn.Identity()
     feat_ext.node = identity_node
@@ -74,33 +76,34 @@ def test_deterministic_attention_timestep():
     feat_ext.eval()
 
     with torch.no_grad():
-        z_selected = feat_ext(x) # (2, 128)
-        
-        captured_h = []
-        def hook_fn(m, inp, out):
-            captured_h.append(out.detach())
-        handle = feat_ext.layer_norm.register_forward_hook(hook_fn)
-        _ = feat_ext(x)
-        handle.remove()
+        z_selected = feat_ext(x)  # (2, 128)
 
-        h_full = captured_h[0] # (2, 10, 128)
-        h_last = h_full[:, -1, :]
-        h_second_last = h_full[:, -2, :]
-        h_mean = h_full.mean(dim=1)
+    captured_h = []
 
-        diff_selected = torch.norm(z_selected - h_last).item()
-        diff_second_last = torch.norm(z_selected - h_second_last).item()
-        diff_mean = torch.norm(z_selected - h_mean).item()
+    def hook_fn(m, inp, out):
+        captured_h.append(out.detach())
 
-        assert diff_selected < 1e-5, f"FeatureExtractor did not select last timestep -1! (diff={diff_selected})"
-        assert diff_second_last > 1e-3, "FeatureExtractor erroneously matched second-to-last timestep (-2)"
-        assert diff_mean > 1e-3, "FeatureExtractor erroneously matched mean pooling"
+    handle = feat_ext.layer_norm.register_forward_hook(hook_fn)
+    _ = feat_ext(x)
+    handle.remove()
 
-    print("  -> Deterministic timestep test passed: Exactly last timestep (-1) verified.")
+    h_full = captured_h[0]  # (2, 10, 128)
+    h_last = h_full[:, -1, :]
+    h_second_last = h_full[:, -2, :]
+    h_mean = h_full.mean(dim=1)
+
+    diff_selected = torch.norm(z_selected - h_last).item()
+    diff_second_last = torch.norm(z_selected - h_second_last).item()
+    diff_mean = torch.norm(z_selected - h_mean).item()
+
+    assert diff_selected < 1e-5, f"FeatureExtractor did not select last timestep -1! (diff={diff_selected})"
+    assert diff_second_last > 1e-3, "FeatureExtractor erroneously matched second-to-last timestep (-2)"
+    assert diff_mean > 1e-3, "FeatureExtractor erroneously matched mean pooling"
+    print(" -> Deterministic timestep test passed: Exactly last timestep (-1) verified.")
 
 
 def test_theta_gradient_flow():
-    print("[TEST 3/8] Testing Trainable Trade-off Parameters (theta_S, theta_T) Gradient Flow...")
+    print("[TEST 3/8] Testing Constrained Trade-off Parameters (theta_S, theta_T) Gradient Flow...")
     model = HybridoNetAdapt(input_dim=18, hidden_dim=128, num_lstm_layers=2, num_heads=4, dropout=0.1)
     criterion_mse = nn.MSELoss()
 
@@ -111,11 +114,23 @@ def test_theta_gradient_flow():
     loss_target = criterion_mse(y_comb_t, tgt_y)
     loss_target.backward()
 
-    assert model.theta_s.grad is not None, "theta_S failed to receive gradients!"
-    assert model.theta_t.grad is not None, "theta_T failed to receive gradients!"
-    assert abs(model.theta_s.grad.item()) > 1e-7, "theta_S gradient is zero!"
-    assert abs(model.theta_t.grad.item()) > 1e-7, "theta_T gradient is zero!"
-    print(f"  -> Gradient Flow verified: dL/dtheta_S = {model.theta_s.grad.item():.6f}, dL/dtheta_T = {model.theta_t.grad.item():.6f}")
+    # theta_s / theta_t are softmax(theta_logits), so gradients land on the underlying
+    # leaf parameter `theta_logits` rather than on theta_s/theta_t directly.
+    assert model.theta_logits.grad is not None, "theta_logits failed to receive gradients!"
+    assert torch.any(model.theta_logits.grad.abs() > 1e-9), "theta_logits gradient is zero!"
+
+    theta_s_val = model.theta_s.item()
+    theta_t_val = model.theta_t.item()
+    assert 0.0 < theta_s_val < 1.0, f"theta_S must lie strictly in (0, 1), got {theta_s_val}"
+    assert 0.0 < theta_t_val < 1.0, f"theta_T must lie strictly in (0, 1), got {theta_t_val}"
+    assert abs((theta_s_val + theta_t_val) - 1.0) < 1e-5, (
+        f"theta_S + theta_T must equal 1 (convex combination), got {theta_s_val + theta_t_val}"
+    )
+
+    print(
+        f" -> Gradient Flow verified: theta_logits.grad = {model.theta_logits.grad.tolist()}, "
+        f"theta_S={theta_s_val:.3f}, theta_T={theta_t_val:.3f} (sum={theta_s_val + theta_t_val:.3f})"
+    )
 
 
 def test_rolling_window_rul_preprocessing():
@@ -129,15 +144,15 @@ def test_rolling_window_rul_preprocessing():
 
     eol = 200.0
     samples, ruls = extract_cell_samples(cycle_data, eol, window_size=30, stride=30, num_samples=10, rolling=True)
-    
+
     assert len(samples) >= 3, f"Expected at least 3 rolling windows, got {len(samples)}"
     assert samples[0].shape == (10, 3, 6), f"Expected tensor shape (10, 3, 6), got {samples[0].shape}"
-    
+
     # Check exact mathematical RUL values:
     assert ruls[0] == 170.0, f"Expected Window 1 RUL=170.0, got {ruls[0]}"
     assert ruls[1] == 140.0, f"Expected Window 2 RUL=140.0, got {ruls[1]}"
     assert ruls[2] == 110.0, f"Expected Window 3 RUL=110.0, got {ruls[2]}"
-    print(f"  -> Rolling RUL test passed: Window 1 (cycle 30) RUL={ruls[0]}, Window 2 (cycle 60) RUL={ruls[1]}, Window 3 (cycle 90) RUL={ruls[2]}")
+    print(f" -> Rolling RUL test passed: Window 1 (cycle 30) RUL={ruls[0]}, Window 2 (cycle 60) RUL={ruls[1]}, Window 3 (cycle 90) RUL={ruls[2]}")
 
 
 def test_cell_level_disjoint_splitting():
@@ -153,7 +168,6 @@ def test_cell_level_disjoint_splitting():
 
     tr_unique = set(tr_cells)
     ts_unique = set(ts_cells)
-
     assert tr_unique.isdisjoint(ts_unique), f"Leakage detected! Shared cells: {tr_unique.intersection(ts_unique)}"
     assert len(tr_unique) + len(ts_unique) == len(cell_names), "Lost unique cells during partitioning"
     assert len(X_tr) + len(X_ts) == 20, "Lost sample windows during split"
@@ -164,18 +178,17 @@ def test_cell_level_disjoint_splitting():
         _ = split_by_cell_id(X[:10], Y[:10], single_cell_ids, test_ratio=0.2)
         assert False, "Failed to raise ValueError on single-cell dataset!"
     except ValueError:
-        pass # Expected
+        pass  # Expected
 
-    print("  -> Cell-level split test passed: Zero window overlap and ValueError on single cell verified.")
+    print(" -> Cell-level split test passed: Zero window overlap and ValueError on single cell verified.")
 
 
 def test_fixed_ceiling_rul_scaling():
     print("[TEST 6/8] Testing Fixed Physical RUL Normalization Ceiling (5000 cyc) & Overflow Error...")
     scaler = RobustRULScaler(y_max=DEFAULT_RUL_MAX_CEILING)
-    
+
     Y_valid = np.array([50.0, 1200.0, 3200.0, 4800.0])
     Y_scaled = scaler.transform(Y_valid)
-
     assert (Y_scaled >= 0.0).all() and (Y_scaled <= 1.0).all(), f"RUL out of [0, 1] bounds: {Y_scaled}"
     assert Y_scaled.max() < 1.0, f"Max value hit saturation: {Y_scaled.max()}"
 
@@ -188,9 +201,9 @@ def test_fixed_ceiling_rul_scaling():
         _ = scaler.transform(Y_overflow)
         assert False, "Failed to raise ValueError on RUL > 5000!"
     except ValueError:
-        pass # Expected
+        pass  # Expected
 
-    print("  -> Fixed ceiling test passed: 5000-cycle normalization and loud overflow error verified.")
+    print(" -> Fixed ceiling test passed: 5000-cycle normalization and loud overflow error verified.")
 
 
 def test_18d_feature_scaling():
@@ -203,9 +216,10 @@ def test_18d_feature_scaling():
     X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler = fit_and_transform_features_18d(
         X_tr, X_val, X_tgt_adapt, X_tgt_test
     )
+
     assert X_tr_sc.shape == (20, 10, 3, 6)
     assert X_tr_sc.min() >= -1e-6 and X_tr_sc.max() <= 1.0 + 1e-6, "Training features not bounded in [0, 1]"
-    print("  -> 18-D Feature Scaling test passed.")
+    print(" -> 18-D Feature Scaling test passed.")
 
 
 def test_end_to_end_smoke():
@@ -216,7 +230,6 @@ def test_end_to_end_smoke():
 
     X_src = np.random.randn(12, 10, 3, 6).astype(np.float32)
     Y_src = np.random.uniform(200, 2500, 12).astype(np.float32)
-
     X_tgt = np.random.randn(12, 10, 3, 6).astype(np.float32)
     Y_tgt = np.random.uniform(200, 3500, 12).astype(np.float32)
 
@@ -256,7 +269,7 @@ def test_end_to_end_smoke():
     assert np.isfinite(results["test_rmse"]), "Test RMSE is not finite!"
     assert np.isfinite(results["test_mape"]), "Test MAPE is not finite!"
     assert np.isfinite(results["final_theta_s"]) and np.isfinite(results["final_theta_t"]), "Theta weights are not finite!"
-    print(f"  -> End-to-End smoke test passed: Test RMSE={results['test_rmse']:.2f} cyc, theta_S={results['final_theta_s']:.3f}, theta_T={results['final_theta_t']:.3f}")
+    print(f" -> End-to-End smoke test passed: Test RMSE={results['test_rmse']:.2f} cyc, theta_S={results['final_theta_s']:.3f}, theta_T={results['final_theta_t']:.3f}")
 
 
 if __name__ == "__main__":
