@@ -33,14 +33,15 @@ logger = logging.getLogger("ZenodoAcq")
 SEED = 42
 np.random.seed(SEED)
 
-ZENODO_BASE_URL = "https://zenodo.org/api/records/14969822/files/{dataset}.zip/content"
+ZENODO_BASE_URL = "https://zenodo.org/records/14969822/files/{dataset}.zip?download=1"
 
 DATASETS_TO_DOWNLOAD = {
-    "Stanford": "LFP", # Severson et al. 2019 / TRI fast-charging benchmark
+    "MATR": "LFP",     # Severson et al. 2019 / TRI fast-charging benchmark (124 cells, data.matr.io)
     "CALCE": "NMC",    # CALCE NMC/LCO cells
     "HUST": "LFP",     # HUST LFP varied discharge benchmark
     "SNL": "NMC",      # SNL mixed cells
-    "RWTH": "NMC"      # RWTH NMC cells
+    "RWTH": "NMC",     # RWTH NMC cells
+    "Stanford": "LFP"  # Stanford lab cycling dataset (41 cells)
 }
 
 def check_for_synthetic_data(voltage_array):

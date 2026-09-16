@@ -24,12 +24,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("HybridoDownload")
 
-# Zenodo mirrors and direct repository endpoints
+# Zenodo mirrors and direct repository endpoints (Zenodo InvenioRDM ?download=1 endpoint)
 DATASET_URLS = {
-    "TRI": "https://zenodo.org/api/records/14969822/files/Stanford.zip/content", # Severson / TRI Fast Charging
-    "LHP": "https://zenodo.org/api/records/14969822/files/HUST.zip/content",     # Varied discharge LFP/LHP benchmark
-    "CALCE": "https://zenodo.org/api/records/14969822/files/CALCE.zip/content",
-    "SNL": "https://zenodo.org/api/records/14969822/files/SNL.zip/content",
+    "TRI": "https://zenodo.org/records/14969822/files/MATR.zip?download=1",     # Severson et al. 2019 / TRI Fast Charging (124 cells, data.matr.io)
+    "MATR": "https://zenodo.org/records/14969822/files/MATR.zip?download=1",    # Explicit MATR alias
+    "LHP": "https://zenodo.org/records/14969822/files/HUST.zip?download=1",     # Varied discharge LFP/LHP benchmark
+    "HUST": "https://zenodo.org/records/14969822/files/HUST.zip?download=1",    # Explicit HUST alias
+    "CALCE": "https://zenodo.org/records/14969822/files/CALCE.zip?download=1",
+    "SNL": "https://zenodo.org/records/14969822/files/SNL.zip?download=1",
+    "Stanford": "https://zenodo.org/records/14969822/files/Stanford.zip?download=1", # Stanford lab dataset (41 cells)
 }
 
 
