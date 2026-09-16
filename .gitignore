@@ -13,7 +13,14 @@ ehthumbs.db
 Thumbs.db
 
 # Large raw datasets (>100MB GitHub limit)
-data/
+data/raw/
+data/real_processed/
+data/hybridonet/raw/
+data/patchtst_raw/
+data/koopman_processed/
+!data/hybridonet/
+!data/hybridonet/processed/
+!data/hybridonet/processed/*.npz
 
 # Environment
 .env
@@ -34,5 +41,6 @@ checkpoints/
 
 *.parquet
 *.npz
+!data/hybridonet/processed/*.npz
 *.pth
 test_hf.py
