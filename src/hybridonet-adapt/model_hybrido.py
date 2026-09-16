@@ -8,6 +8,7 @@ class ODEFunc(nn.Module):
     Derivative function dz/dt = f(z, t).
     Faithful to paper: f is realized as a single linear layer: dz/dt = W*z + b.
     """
+
     def __init__(self, hidden_dim: int = 128):
         super().__init__()
         self.linear = nn.Linear(hidden_dim, hidden_dim)
@@ -22,6 +23,7 @@ class NeuralODEBlock(nn.Module):
     Integrates hidden state trajectory over continuous time using Runge-Kutta 4 (RK4).
     Evaluates at continuous integration step (t=2 / 2 integration steps).
     """
+
     def __init__(self, hidden_dim: int = 128, num_steps: int = 2):
         super().__init__()
         self.ode_func = ODEFunc(hidden_dim)
@@ -52,6 +54,7 @@ class FeatureExtractor(nn.Module):
     4. Neural ODE (NODE) continuous dynamics block (128 -> 128)
     5. Post-NODE LayerNorm (128 -> 128)
     """
+
     def __init__(
         self,
         input_dim: int = 18,
@@ -84,7 +87,7 @@ class FeatureExtractor(nn.Module):
 
         # 3. Modular Neural ODE Block (128 -> 128)
         self.node = ode_block if ode_block is not None else NeuralODEBlock(hidden_dim=hidden_dim, num_steps=2)
-        
+
         # 4. Table 2: LayerNorm directly following NODE block
         self.node_layer_norm = nn.LayerNorm(hidden_dim)
 
@@ -119,6 +122,7 @@ class Predictor(nn.Module):
     Linear layers [128 -> 64 -> 32 -> 1] with BatchNorm1d, Dropout(0.1), ReLU,
     ending strictly with Sigmoid() activation.
     """
+
     def __init__(self, in_features: int = 128, dropout: float = 0.1):
         super().__init__()
         self.net = nn.Sequential(
@@ -126,12 +130,10 @@ class Predictor(nn.Module):
             nn.ReLU(),
             nn.BatchNorm1d(64),
             nn.Dropout(dropout),
-
             nn.Linear(64, 32),
             nn.ReLU(),
             nn.BatchNorm1d(32),
             nn.Dropout(dropout),
-
             nn.Linear(32, 1),
             nn.Sigmoid()
         )
@@ -144,10 +146,20 @@ class HybridoNetAdapt(nn.Module):
     """
     HybridoNet-Adapt (Tran et al., 2025)
     Complete Domain Adaptation Architecture for Battery RUL.
-    
+
     Target prediction formula:
         Y_hat_T = theta_S * G_Y^S(G_F(X)) + theta_T * G_Y^T(G_F(X))
+
+    ACCURACY FIX: theta_S and theta_T are now parameterized as a softmax over
+    two learnable logits (`theta_logits`) instead of two independent, free
+    scalars. This guarantees theta_S + theta_T == 1 and both weights stay in
+    (0, 1) throughout training, so the combination is always a genuine convex
+    trade-off between the source and target predictors instead of an
+    unconstrained linear combination that can drift to degenerate values
+    (e.g. large or negative weights) and hurt generalization on the target
+    test set.
     """
+
     def __init__(
         self,
         input_dim: int = 18,
@@ -158,6 +170,7 @@ class HybridoNetAdapt(nn.Module):
         ode_block: Optional[nn.Module] = None
     ):
         super().__init__()
+
         # Shared Feature Extractor G_F (128-D)
         self.feature_extractor = FeatureExtractor(
             input_dim=input_dim,
@@ -172,9 +185,23 @@ class HybridoNetAdapt(nn.Module):
         self.source_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
         self.target_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
 
-        # Trainable Trade-Off Parameters
-        self.theta_s = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
-        self.theta_t = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
+        # Trainable Trade-Off Parameters, constrained to a convex combination via
+        # softmax(theta_logits) -> (theta_s, theta_t), theta_s + theta_t == 1.
+        # Initialized to [0, 0] so softmax gives the original 0.5 / 0.5 starting point.
+        self.theta_logits = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+    @property
+    def theta_weights(self) -> torch.Tensor:
+        """Softmax-normalized (theta_s, theta_t), always summing to 1."""
+        return torch.softmax(self.theta_logits, dim=0)
+
+    @property
+    def theta_s(self) -> torch.Tensor:
+        return self.theta_weights[0]
+
+    @property
+    def theta_t(self) -> torch.Tensor:
+        return self.theta_weights[1]
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extracts 128-dimensional feature embeddings z."""
@@ -183,6 +210,7 @@ class HybridoNetAdapt(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
+
         Returns:
             y_hat_comb: Combined target prediction = theta_s * y_hat_s + theta_t * y_hat_t
             y_hat_s: Source predictor output
@@ -192,8 +220,9 @@ class HybridoNetAdapt(nn.Module):
         z = self.extract_features(x)
         y_hat_s = self.source_predictor(z)
         y_hat_t = self.target_predictor(z)
-        
-        # Direct sum weighting as specified in Eq. (11)
-        y_hat_comb = self.theta_s * y_hat_s + self.theta_t * y_hat_t
-        
+
+        theta_s, theta_t = self.theta_s, self.theta_t
+        # Convex-combination weighting (theta_s + theta_t == 1 by construction)
+        y_hat_comb = theta_s * y_hat_s + theta_t * y_hat_t
+
         return y_hat_comb, y_hat_s, y_hat_t, z

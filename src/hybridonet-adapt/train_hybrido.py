@@ -4,13 +4,23 @@ HybridoNet-Adapt Training and Evaluation Pipeline (Tran et al., 2025).
 
 Implements:
 1. Strict Cell-Level Splitting: Zero intra-battery window leakage across train/validation/test partitions.
-2. Robust Physical RUL Normalization: Fixed 5000-cycle ceiling with strict error on overflow (no silent corruption).
+2. Robust Physical RUL Normalization: Configurable cycle ceiling with strict error on overflow (no silent corruption).
 3. Published Architecture (Table 2): 128-D Feature Extractor (LSTM + MHA + NODE) and last attention timestep.
 4. Combined Objective: L_total = L_MSE(Source) + L_MSE(Target_Combined) + lambda(p) * L_MMD
-5. Exact Trainable Trade-Off Optimization: Target loss is MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target)
+5. Constrained Trade-Off Optimization: theta_s + theta_t == 1 via softmax(theta_logits); target loss is
+   MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target).
 6. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
 7. Scientific Validation: Model selection is driven strictly by validation loss. Blind test set is evaluated ONLY ONCE at the end.
 8. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
+
+ACCURACY IMPROVEMENTS over the original version:
+- Multi-kernel, adaptive-bandwidth MMD loss (see mmd_loss.py) instead of a single fixed-sigma kernel.
+- Constrained (softmax) theta_s/theta_t trade-off parameters (see model_hybrido.py) instead of
+  unconstrained free scalars.
+- Cosine-annealed learning rate schedule + gradient clipping for more stable convergence.
+- Optional early stopping on validation RMSE so a higher epoch budget doesn't waste compute or overfit.
+- Configurable RUL ceiling and MMD kernel settings from the CLI so they can be tuned per dataset
+  instead of hardcoded.
 """
 
 import os
@@ -48,6 +58,7 @@ logger = logging.getLogger("HybridoTrain")
 
 class BatteryDataset(Dataset):
     """PyTorch Dataset for battery tensor samples."""
+
     def __init__(self, X: np.ndarray, Y: np.ndarray):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.Y = torch.tensor(Y, dtype=torch.float32).unsqueeze(-1)
@@ -68,6 +79,7 @@ class RobustRULScaler:
     Normalizes RUL to [0, 1] using a fixed physical ceiling (default 5000 cycles).
     Raises ValueError loudly on overflow instead of silently clipping and corrupting labels.
     """
+
     def __init__(self, y_max: float = DEFAULT_RUL_MAX_CEILING):
         self.y_max = float(y_max)
 
@@ -143,6 +155,7 @@ def fit_and_transform_features_18d(
     Fits MinMaxScaler across all samples and time steps over the 18 physical feature dimensions.
     X shape: (N, 10, 3, 6) -> (N*10, 18) for scaling.
     """
+
     def to_flat18(arr):
         n, s, c, f = arr.shape
         return arr.reshape(n * s, c * f), (n, s, c, f)
@@ -172,22 +185,36 @@ def train_hybrido_session(
     target_y_test_raw: np.ndarray,
     val_y_raw: np.ndarray,
     scaler_y: RobustRULScaler,
-    epochs: int = 10,
+    epochs: int = 60,
     lr: float = 0.0005,
-    sigma_mmd: float = 1.0,
+    sigma_mmd: Optional[float] = None,
+    mmd_kernel_num: int = 5,
+    mmd_kernel_mul: float = 2.0,
+    grad_clip_norm: float = 5.0,
+    early_stop_patience: Optional[int] = 15,
     device: str = "cpu"
 ) -> Dict[str, float]:
     """
-    Paper-faithful training loop with validation-driven checkpoint selection and trainable theta parameters.
+    Paper-faithful training loop with validation-driven checkpoint selection and
+    constrained trainable theta parameters.
+
+    ACCURACY IMPROVEMENTS vs. the original loop:
+    - MMDLoss now uses a multi-kernel, adaptive bandwidth (see mmd_loss.py) rather than a single
+      fixed sigma, which is far more robust to the actual scale of the 128-D latent features.
+    - A cosine-annealed LR schedule + gradient-norm clipping stabilize training over longer runs.
+    - Optional early stopping (on validation RMSE) lets you raise the epoch budget without
+      wasting compute once the model has converged.
     """
     model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
     criterion_mse = nn.MSELoss()
-    mmd_loss_fn = MMDLoss(sigma=sigma_mmd, fix_sigma=True)
+    mmd_loss_fn = MMDLoss(kernel_num=mmd_kernel_num, kernel_mul=mmd_kernel_mul, fix_sigma=sigma_mmd)
 
     best_val_rmse = float("inf")
     best_model_state = None
     best_epoch = 0
+    epochs_since_improve = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -200,7 +227,6 @@ def train_hybrido_session(
         batches = 0
 
         target_iter = iter(target_loader)
-
         for src_x, src_y in source_loader:
             try:
                 tgt_x, tgt_y = next(target_iter)
@@ -221,13 +247,15 @@ def train_hybrido_session(
             y_comb_t, _, _, z_t = model(tgt_x)
             loss_target = criterion_mse(y_comb_t, tgt_y)
 
-            # 3. Maximum Mean Discrepancy (MMD) Loss between feature representations
+            # 3. Multi-Kernel Maximum Mean Discrepancy (MMD) Loss between feature representations
             loss_mmd = mmd_loss_fn(z_s, z_t)
 
             # 4. Total Loss
             loss_total = loss_source + loss_target + lambda_p * loss_mmd
 
             loss_total.backward()
+            if grad_clip_norm is not None and grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
 
             total_loss_accum += loss_total.item()
@@ -235,6 +263,8 @@ def train_hybrido_session(
             tgt_loss_accum += loss_target.item()
             mmd_loss_accum += loss_mmd.item()
             batches += 1
+
+        scheduler.step()
 
         # Validation Step (Model Selection occurs strictly on VALIDATION split)
         model.eval()
@@ -249,20 +279,33 @@ def train_hybrido_session(
         val_preds_unscaled = scaler_y.inverse_transform(val_preds)
         val_rmse = float(np.sqrt(mean_squared_error(val_y_raw, val_preds_unscaled)))
 
-        if val_rmse < best_val_rmse:
+        improved = val_rmse < best_val_rmse
+        if improved:
             best_val_rmse = val_rmse
             best_epoch = epoch
             best_model_state = copy.deepcopy(model.state_dict())
+            epochs_since_improve = 0
+        else:
+            epochs_since_improve += 1
 
+        current_lr = optimizer.param_groups[0]["lr"]
         logger.info(
             f"Epoch [{epoch:03d}/{epochs:03d}] "
             f"Loss: {total_loss_accum / max(1, batches):.4f} | "
             f"Src MSE: {src_loss_accum / max(1, batches):.4f} | "
             f"Tgt MSE: {tgt_loss_accum / max(1, batches):.4f} | "
             f"MMD: {mmd_loss_accum / max(1, batches):.4f} (lambda={lambda_p:.3f}) | "
+            f"LR: {current_lr:.2e} | "
             f"Val RMSE: {val_rmse:.2f} cyc | "
             f"theta_S: {model.theta_s.item():.3f}, theta_T: {model.theta_t.item():.3f}"
         )
+
+        if early_stop_patience is not None and epochs_since_improve >= early_stop_patience:
+            logger.info(
+                f"Early stopping: no Val RMSE improvement for {early_stop_patience} epochs "
+                f"(best was epoch {best_epoch} at {best_val_rmse:.2f} cyc)."
+            )
+            break
 
     # FINAL EVALUATION: Load best checkpoint chosen by validation, test target set EXACTLY ONCE
     if best_model_state is not None:
@@ -278,11 +321,13 @@ def train_hybrido_session(
 
     test_preds = np.array(test_preds)
     test_preds_unscaled = scaler_y.inverse_transform(test_preds)
-
     final_test_rmse = float(np.sqrt(mean_squared_error(target_y_test_raw, test_preds_unscaled)))
     final_test_mape = float(mean_absolute_percentage_error(target_y_test_raw, test_preds_unscaled) * 100.0)
 
-    logger.info(f"\n[FINAL TEST EVALUATION] Chosen Epoch: {best_epoch} | Test RMSE: {final_test_rmse:.2f} cycles | Test MAPE: {final_test_mape:.2f}%")
+    logger.info(
+        f"\n[FINAL TEST EVALUATION] Chosen Epoch: {best_epoch} | "
+        f"Test RMSE: {final_test_rmse:.2f} cycles | Test MAPE: {final_test_mape:.2f}%"
+    )
 
     return {
         "best_epoch": best_epoch,
@@ -297,10 +342,15 @@ def train_hybrido_session(
 def run_benchmark(
     source_npz: str,
     target_npz: str,
-    epochs: int = 10,
+    epochs: int = 60,
     batch_size: int = 128,
     lr: float = 0.0005,
     val_ratio: float = 0.10,
+    sigma_mmd: Optional[float] = None,
+    mmd_kernel_num: int = 5,
+    mmd_kernel_mul: float = 2.0,
+    early_stop_patience: Optional[int] = 15,
+    rul_ceiling: float = DEFAULT_RUL_MAX_CEILING,
     device: str = "cpu"
 ):
     """
@@ -336,11 +386,17 @@ def run_benchmark(
 
     logger.info("=" * 50)
     logger.info("DATASET PARTITIONING BREAKDOWN (CELL-LEVEL GROUPING)")
-    logger.info(f"Source Training:   {len(np.unique(tr_c)):3d} cells | {len(X_tr_raw):5d} windows")
-    logger.info(f"Source Validation: {len(np.unique(val_c)):3d} cells | {len(X_val_raw):5d} windows")
-    logger.info(f"Target Adaptation: {len(np.unique(ad_c)):3d} cells | {len(X_tgt_adapt):5d} windows")
-    logger.info(f"Target Blind Test: {len(np.unique(ts_c)):3d} cells | {len(X_tgt_test):5d} windows")
+    logger.info(f"Source Training:    {len(np.unique(tr_c)):3d} cells | {len(X_tr_raw):5d} windows")
+    logger.info(f"Source Validation:  {len(np.unique(val_c)):3d} cells | {len(X_val_raw):5d} windows")
+    logger.info(f"Target Adaptation:  {len(np.unique(ad_c)):3d} cells | {len(X_tgt_adapt):5d} windows")
+    logger.info(f"Target Blind Test:  {len(np.unique(ts_c)):3d} cells | {len(X_tgt_test):5d} windows")
     logger.info("=" * 50)
+    if len(X_tr_raw) < 200 or len(X_tgt_adapt) < 200:
+        logger.warning(
+            "Training window counts look low. If you generated these .npz files with a large "
+            "--stride in preprocess_hybrido.py, consider re-running preprocessing with a smaller "
+            "stride (overlapping windows) to give the model more training signal."
+        )
 
     # 2. 18-D Feature Scaling across samples and time steps
     X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler_x = fit_and_transform_features_18d(
@@ -348,7 +404,7 @@ def run_benchmark(
     )
 
     # 3. Robust Physical RUL Normalization (guarantees Y in [0, 1] without Sigmoid saturation)
-    scaler_y = RobustRULScaler(y_max=DEFAULT_RUL_MAX_CEILING).fit()
+    scaler_y = RobustRULScaler(y_max=rul_ceiling).fit()
     Y_tr_sc = scaler_y.transform(Y_tr_raw)
     Y_val_sc = scaler_y.transform(Y_val_raw)
     Y_tgt_ad_sc = scaler_y.transform(Y_tgt_adapt)
@@ -356,6 +412,7 @@ def run_benchmark(
 
     drop_src = len(X_tr_sc) > batch_size
     drop_tgt = len(X_tgt_ad_sc) > batch_size
+
     src_loader = DataLoader(BatteryDataset(X_tr_sc, Y_tr_sc), batch_size=batch_size, shuffle=True, drop_last=drop_src)
     val_loader = DataLoader(BatteryDataset(X_val_sc, Y_val_sc), batch_size=batch_size, shuffle=False)
     tgt_loader = DataLoader(BatteryDataset(X_tgt_ad_sc, Y_tgt_ad_sc), batch_size=batch_size, shuffle=True, drop_last=drop_tgt)
@@ -381,15 +438,19 @@ def run_benchmark(
         scaler_y=scaler_y,
         epochs=epochs,
         lr=lr,
+        sigma_mmd=sigma_mmd,
+        mmd_kernel_num=mmd_kernel_num,
+        mmd_kernel_mul=mmd_kernel_mul,
+        early_stop_patience=early_stop_patience,
         device=device
     )
 
-    logger.info("\n" + "="*50)
+    logger.info("\n" + "=" * 50)
     logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
     logger.info(f"Target Test RMSE: {results['test_rmse']:.2f} cycles")
     logger.info(f"Target Test MAPE: {results['test_mape']:.2f}%")
     logger.info(f"Trained Trade-off Weights: theta_S={results['final_theta_s']:.4f}, theta_T={results['final_theta_t']:.4f}")
-    logger.info("="*50)
+    logger.info("=" * 50)
 
 
 def resolve_file_path(path_str: str) -> str:
@@ -408,10 +469,15 @@ def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Benchmark Runner")
     parser.add_argument("--source", type=str, required=True, help="Path to source .npz raw features (REQUIRED)")
     parser.add_argument("--target", type=str, required=True, help="Path to target .npz raw features (REQUIRED)")
-    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (paper default=10)")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs (default=60; raised from the paper's 10 for better convergence, paired with early stopping)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size (paper default=128)")
-    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005)")
+    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005), cosine-annealed over training")
     parser.add_argument("--val-ratio", type=float, default=0.10, help="Source cell validation ratio (default 0.10)")
+    parser.add_argument("--sigma-mmd", type=float, default=None, help="Fixed MMD bandwidth. If omitted (default), the bandwidth is estimated adaptively per batch, which is more robust than a hardcoded value.")
+    parser.add_argument("--mmd-kernel-num", type=int, default=5, help="Number of Gaussian kernels to sum for multi-kernel MMD (default=5)")
+    parser.add_argument("--mmd-kernel-mul", type=float, default=2.0, help="Geometric spacing factor between MMD kernel bandwidths (default=2.0)")
+    parser.add_argument("--early-stop-patience", type=int, default=15, help="Stop if Val RMSE hasn't improved for this many epochs. Set to 0 to disable.")
+    parser.add_argument("--rul-ceiling", type=float, default=DEFAULT_RUL_MAX_CEILING, help="Fixed physical RUL ceiling in cycles used for normalization (default=5000). Set this closer to your dataset's real max cycle life for better label resolution.")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -425,6 +491,8 @@ def main():
     if not os.path.exists(tgt_path):
         raise FileNotFoundError(f"Target feature file not found: {args.target}")
 
+    early_stop_patience = args.early_stop_patience if args.early_stop_patience and args.early_stop_patience > 0 else None
+
     run_benchmark(
         source_npz=src_path,
         target_npz=tgt_path,
@@ -432,6 +500,11 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         val_ratio=args.val_ratio,
+        sigma_mmd=args.sigma_mmd,
+        mmd_kernel_num=args.mmd_kernel_num,
+        mmd_kernel_mul=args.mmd_kernel_mul,
+        early_stop_patience=early_stop_patience,
+        rul_ceiling=args.rul_ceiling,
         device=device
     )
 
