@@ -183,7 +183,7 @@ def download_and_process_dataset(dataset_name, chemistry, raw_dir, proc_dir, tes
         try:
             logger.info("Executing curl...")
             import subprocess
-            subprocess.run(["curl", "-L", "-o", zip_path, url], check=True)
+            subprocess.run(["curl", "-f", "-L", "--retry", "2", "--retry-delay", "3", "-o", zip_path, url], check=True)
             print()
         except Exception as e:
             logger.error(f"Failed to download {dataset_name}.zip: {e}")
