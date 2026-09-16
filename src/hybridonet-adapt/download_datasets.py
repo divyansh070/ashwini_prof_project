@@ -70,23 +70,26 @@ def link_existing_project_data(project_root: str, dest_dir: str):
         logger.info(f"Found existing processed data in {source_processed}. Linking to HybridoNet pipeline...")
         os.makedirs(dest_dir, exist_ok=True)
         for f in os.listdir(source_processed):
-            if f.endswith(".parquet"):
-                src_file = os.path.join(source_processed, f)
-                dst_file = os.path.join(dest_dir, f)
-                if not os.path.exists(dst_file):
+            src_file = os.path.join(source_processed, f)
+            dst_file = os.path.join(dest_dir, f)
+            if not os.path.exists(dst_file):
+                if f.endswith(".parquet") or os.path.isdir(src_file):
                     try:
                         os.symlink(src_file, dst_file)
                         logger.info(f"Symlinked {f} -> {dst_file}")
                     except Exception:
                         import shutil
-                        shutil.copy2(src_file, dst_file)
+                        if os.path.isdir(src_file):
+                            shutil.copytree(src_file, dst_file)
+                        else:
+                            shutil.copy2(src_file, dst_file)
                         logger.info(f"Copied {f} -> {dst_file}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Download TRI and LHP datasets for HybridoNet-Adapt")
     parser.add_argument("--output-dir", type=str, default="data/hybridonet/raw", help="Target download directory")
-    parser.add_argument("--datasets", nargs="+", default=["TRI", "LHP"], choices=["TRI", "LHP", "CALCE", "SNL"], help="Datasets to download")
+    parser.add_argument("--datasets", nargs="+", default=["TRI", "LHP"], choices=list(DATASET_URLS.keys()), help="Datasets to download")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

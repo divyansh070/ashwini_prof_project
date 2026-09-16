@@ -194,6 +194,11 @@ def process_parquet_dataset(
             eol = float(cell_df["max_cycle"].dropna().iloc[0])
         else:
             eol = float(cell_df["cycle_number"].max())
+            logger.warning(
+                f"⚠️ [EOL Fallback] Cell '{cid}' in domain '{domain_name}' ({parquet_path}) is missing "
+                f"'cycle_life' and 'max_cycle' columns! Falling back to cycle_number.max() ({eol:.0f} cyc). "
+                f"This may distort RUL targets near EOL if the cell test ended before capacity threshold failure."
+            )
 
         cycle_data = {}
         for cyc_num, group in cell_df.groupby("cycle_number"):
@@ -252,9 +257,78 @@ def process_domain_parquet_files(
     return np.concatenate(all_X, axis=0), np.concatenate(all_Y, axis=0), all_samples, all_cells
 
 
+CANONICAL_ALIASES = {
+    "tri": ["TRI", "MATR"],
+    "matr": ["TRI", "MATR"],
+    "lhp": ["HUST", "LHP"],
+    "hust": ["HUST", "LHP"],
+}
+
+DEFAULT_DATA_DIR = "data/hybridonet/raw"
+FALLBACK_DATA_DIR = "data/real_processed"
+
+
+def has_parquet_files(path: str) -> bool:
+    """Checks if a directory or its immediate subdirectories contain any .parquet files."""
+    if not os.path.exists(path):
+        return False
+    if glob.glob(os.path.join(path, "*.parquet")):
+        return True
+    try:
+        for d in os.listdir(path):
+            sub = os.path.join(path, d)
+            if os.path.isdir(sub) and glob.glob(os.path.join(sub, "*.parquet")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def save_feature_dataset(
+    output_dir: str,
+    domain_name: str,
+    X: np.ndarray,
+    Y: np.ndarray,
+    sample_ids: List[str],
+    cell_ids: List[str]
+) -> List[str]:
+    """
+    Saves raw unscaled feature tensors and automatically writes canonical aliases
+    (e.g., both TRI_raw_features.npz and MATR_raw_features.npz; both HUST and LHP)
+    consistently across both domain subdirectories and top-level parquet files.
+    """
+    saved_paths = []
+    primary_file = os.path.join(output_dir, f"{domain_name}_raw_features.npz")
+    np.savez_compressed(
+        primary_file,
+        X=X,
+        Y=Y,
+        sample_ids=np.array(sample_ids),
+        cell_ids=np.array(cell_ids)
+    )
+    saved_paths.append(primary_file)
+
+    dom_lower = domain_name.lower()
+    if dom_lower in CANONICAL_ALIASES:
+        for alias in CANONICAL_ALIASES[dom_lower]:
+            alias_file = os.path.join(output_dir, f"{alias}_raw_features.npz")
+            if os.path.abspath(alias_file) != os.path.abspath(primary_file):
+                np.savez_compressed(
+                    alias_file,
+                    X=X,
+                    Y=Y,
+                    sample_ids=np.array(sample_ids),
+                    cell_ids=np.array(cell_ids)
+                )
+                saved_paths.append(alias_file)
+                logger.info(f"Saved canonical alias -> {alias_file}")
+
+    return saved_paths
+
+
 def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Rolling RUL Preprocessing")
-    parser.add_argument("--data-dir", type=str, default="data/real_processed", help="Directory containing processed battery parquets")
+    parser.add_argument("--data-dir", type=str, default=DEFAULT_DATA_DIR, help="Directory containing processed battery parquets (default: data/hybridonet/raw, with automatic fallback to data/real_processed)")
     parser.add_argument("--output-dir", type=str, default="data/hybridonet/processed", help="Output directory for raw unscaled tensors")
     parser.add_argument("--window-size", type=int, default=30, help="Observation window size (cycles)")
     parser.add_argument("--stride", type=int, default=10, help="Window stride for rolling RUL samples (default=10, overlapping windows for more training data; use 30 for the original non-overlapping paper setup)")
@@ -265,7 +339,16 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     rolling = not args.early_only
 
-    logger.info(f"Extracting HybridoNet features (Rolling RUL mode: {rolling}, Window: {args.window_size}, Stride: {args.stride})...")
+    # Automatic fallback: if default data/hybridonet/raw has no parquets, fall back to data/real_processed
+    data_dir = args.data_dir
+    if data_dir == DEFAULT_DATA_DIR and not has_parquet_files(data_dir):
+        if has_parquet_files(FALLBACK_DATA_DIR):
+            logger.info(
+                f"No parquet datasets found in '{data_dir}'; automatically using existing project data in '{FALLBACK_DATA_DIR}'"
+            )
+            data_dir = FALLBACK_DATA_DIR
+
+    logger.info(f"Extracting HybridoNet features from '{data_dir}' (Rolling RUL mode: {rolling}, Window: {args.window_size}, Stride: {args.stride})...")
     if rolling and args.stride >= args.window_size:
         logger.info(
             f"Note: stride ({args.stride}) >= window size ({args.window_size}) produces non-overlapping "
@@ -274,36 +357,25 @@ def main():
 
     domains_processed = set()
 
-    # 1. Discover domain subdirectories (e.g. data/real_processed/Stanford/, data/real_processed/HUST/)
-    if os.path.exists(args.data_dir):
-        subdirs = [d for d in os.listdir(args.data_dir) if os.path.isdir(os.path.join(args.data_dir, d))]
+    # 1. Discover domain subdirectories (e.g. data/hybridonet/raw/TRI/, data/real_processed/hust/)
+    if os.path.exists(data_dir):
+        subdirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
         for d in subdirs:
-            domain_path = os.path.join(args.data_dir, d)
+            domain_path = os.path.join(data_dir, d)
             parquets = glob.glob(os.path.join(domain_path, "*.parquet"))
             if parquets:
                 X, Y, s_ids, c_ids = process_domain_parquet_files(
                     parquets, d, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
                 )
                 if len(X) > 0:
-                    out_file = os.path.join(args.output_dir, f"{d}_raw_features.npz")
-                    np.savez_compressed(
-                        out_file,
-                        X=X,
-                        Y=Y,
-                        sample_ids=np.array(s_ids),
-                        cell_ids=np.array(c_ids)
-                    )
+                    saved = save_feature_dataset(args.output_dir, d, X, Y, s_ids, c_ids)
                     n_cells = len(np.unique(c_ids))
-                    logger.info(f"Saved {d}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
-                    if d.lower() == "matr":
-                        tri_alias = os.path.join(args.output_dir, "TRI_raw_features.npz")
-                        np.savez_compressed(tri_alias, X=X, Y=Y, sample_ids=np.array(s_ids), cell_ids=np.array(c_ids))
-                        logger.info(f"Saved TRI alias -> {tri_alias}")
+                    logger.info(f"Saved {d}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {saved[0]}")
                     domains_processed.add(d)
 
-    # 2. Discover top-level parquet files (e.g. data/real_processed/Stanford.parquet)
-    if os.path.exists(args.data_dir):
-        top_parquets = glob.glob(os.path.join(args.data_dir, "*.parquet"))
+    # 2. Discover top-level parquet files (e.g. data/hybridonet/raw/TRI.parquet)
+    if os.path.exists(data_dir):
+        top_parquets = glob.glob(os.path.join(data_dir, "*.parquet"))
         for p_file in top_parquets:
             domain = os.path.splitext(os.path.basename(p_file))[0]
             if domain not in domains_processed:
@@ -311,20 +383,13 @@ def main():
                     p_file, domain, window_size=args.window_size, stride=args.stride, num_samples=args.num_samples, rolling=rolling
                 )
                 if len(X) > 0:
-                    out_file = os.path.join(args.output_dir, f"{domain}_raw_features.npz")
-                    np.savez_compressed(
-                        out_file,
-                        X=X,
-                        Y=Y,
-                        sample_ids=np.array(s_ids),
-                        cell_ids=np.array(c_ids)
-                    )
+                    saved = save_feature_dataset(args.output_dir, domain, X, Y, s_ids, c_ids)
                     n_cells = len(np.unique(c_ids))
-                    logger.info(f"Saved {domain}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
+                    logger.info(f"Saved {domain}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {saved[0]}")
                     domains_processed.add(domain)
 
     if not domains_processed:
-        logger.warning(f"No battery parquet datasets found in {args.data_dir}. Please run dataset downloader first.")
+        logger.warning(f"No battery parquet datasets found in '{data_dir}'. Please run dataset downloader first.")
     else:
         logger.info("Raw feature extraction completed with zero global scaling leakage.")
 
