@@ -295,6 +295,10 @@ def main():
                     )
                     n_cells = len(np.unique(c_ids))
                     logger.info(f"Saved {d}: {len(X)} samples across {n_cells} unique cells, RUL range: [{Y.min():.0f}, {Y.max():.0f}] cyc -> {out_file}")
+                    if d.lower() == "matr":
+                        tri_alias = os.path.join(args.output_dir, "TRI_raw_features.npz")
+                        np.savez_compressed(tri_alias, X=X, Y=Y, sample_ids=np.array(s_ids), cell_ids=np.array(c_ids))
+                        logger.info(f"Saved TRI alias -> {tri_alias}")
                     domains_processed.add(d)
 
     # 2. Discover top-level parquet files (e.g. data/real_processed/Stanford.parquet)

@@ -454,14 +454,25 @@ def run_benchmark(
 
 
 def resolve_file_path(path_str: str) -> str:
-    """Resolves file path with case-insensitive fallback on Linux/Colab filesystems."""
+    """Resolves file path with case-insensitive fallback and TRI/MATR alias on Linux/Colab filesystems."""
     if os.path.exists(path_str):
         return path_str
     dirname, basename = os.path.split(path_str)
     if os.path.exists(dirname):
+        # 1. Exact case-insensitive match
         for f in os.listdir(dirname):
             if f.lower() == basename.lower():
                 return os.path.join(dirname, f)
+        # 2. TRI <-> MATR alias match
+        alias_target = None
+        if "tri" in basename.lower():
+            alias_target = basename.lower().replace("tri", "matr")
+        elif "matr" in basename.lower():
+            alias_target = basename.lower().replace("matr", "tri")
+        if alias_target:
+            for f in os.listdir(dirname):
+                if f.lower() == alias_target:
+                    return os.path.join(dirname, f)
     return path_str
 
 
