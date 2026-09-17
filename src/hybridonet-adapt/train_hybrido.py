@@ -362,6 +362,7 @@ def train_hybrido_session(
         "test_r2": final_test_r2,
         "test_paper_mape": final_test_paper_mape,
         "test_floor_mape": final_test_floor_mape,
+        "test_raw_mape": final_test_raw_mape,
         "test_mape": final_test_paper_mape,
         "final_theta_s": float(model.theta_s.item()),
         "final_theta_t": float(model.theta_t.item())
@@ -400,7 +401,7 @@ def run_benchmark(
 
     # Optional filter: Filter MATR (169 cells) down to the 124 cells from Severson et al. 2019 (batches 1-3)
     if severson_only and "matr" in source_npz.lower():
-        severson_mask = np.array([not str(c).startswith("MATR_b4") for c in src_cells])
+        severson_mask = np.array(["b4c" not in str(c).lower() and "_b4" not in str(c).lower() for c in src_cells])
         if np.any(severson_mask):
             X_src_raw = X_src_raw[severson_mask]
             Y_src_raw = Y_src_raw[severson_mask]
