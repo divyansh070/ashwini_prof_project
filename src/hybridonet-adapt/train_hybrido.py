@@ -194,6 +194,7 @@ def train_hybrido_session(
     sigma_mmd: Optional[float] = None,
     mmd_kernel_num: int = 5,
     mmd_kernel_mul: float = 2.0,
+    mmd_weight: float = 0.1,
     grad_clip_norm: float = 5.0,
     early_stop_patience: Optional[int] = 15,
     device: str = "cpu"
@@ -203,8 +204,8 @@ def train_hybrido_session(
     constrained trainable theta parameters.
 
     ACCURACY IMPROVEMENTS vs. the original loop:
-    - MMDLoss now uses a multi-kernel, adaptive bandwidth (see mmd_loss.py) rather than a single
-      fixed sigma, which is far more robust to the actual scale of the 128-D latent features.
+    - MMDLoss uses a multi-kernel, adaptive bandwidth normalized by kernel_num.
+    - mmd_weight scales MMD to 10-20% of MSE loss magnitude to prevent representation mode collapse.
     - A cosine-annealed LR schedule + gradient-norm clipping stabilize training over longer runs.
     - Optional early stopping (on validation RMSE) lets you raise the epoch budget without
       wasting compute once the model has converged.
@@ -254,8 +255,9 @@ def train_hybrido_session(
             # 3. Multi-Kernel Maximum Mean Discrepancy (MMD) Loss between feature representations
             loss_mmd = mmd_loss_fn(z_s, z_t)
 
-            # 4. Total Loss
-            loss_total = loss_source + loss_target + lambda_p * loss_mmd
+            # 4. Total Loss (balanced by mmd_weight to prevent MMD from overwhelming regression MSE)
+            eff_lambda = mmd_weight * lambda_p
+            loss_total = loss_source + loss_target + eff_lambda * loss_mmd
 
             loss_total.backward()
             if grad_clip_norm is not None and grad_clip_norm > 0:
@@ -300,7 +302,7 @@ def train_hybrido_session(
             f"Loss: {total_loss_accum / max(1, batches):.4f} | "
             f"Src MSE: {src_loss_accum / max(1, batches):.4f} | "
             f"Tgt MSE: {tgt_loss_accum / max(1, batches):.4f} | "
-            f"MMD: {mmd_loss_accum / max(1, batches):.4f} (lambda={lambda_p:.3f}) | "
+            f"MMD: {mmd_loss_accum / max(1, batches):.4f} (eff_lambda={eff_lambda:.3f}) | "
             f"LR: {current_lr:.2e} | "
             f"Val RMSE: {val_rmse:.2f} cyc | "
             f"Val Preds: [{val_pred_min:.3f}, {val_pred_max:.3f}] | "
@@ -383,6 +385,7 @@ def run_benchmark(
     rul_ceiling: float = DEFAULT_RUL_MAX_CEILING,
     norm_type: str = "layernorm",
     severson_only: bool = False,
+    mmd_weight: float = 0.1,
     device: str = "cpu"
 ):
     """
@@ -484,6 +487,7 @@ def run_benchmark(
         sigma_mmd=sigma_mmd,
         mmd_kernel_num=mmd_kernel_num,
         mmd_kernel_mul=mmd_kernel_mul,
+        mmd_weight=mmd_weight,
         early_stop_patience=early_stop_patience,
         device=device
     )
@@ -533,6 +537,7 @@ def main():
     parser.add_argument("--sigma-mmd", type=float, default=None, help="Fixed MMD bandwidth. If omitted (default), the bandwidth is estimated adaptively per batch, which is more robust than a hardcoded value.")
     parser.add_argument("--mmd-kernel-num", type=int, default=5, help="Number of Gaussian kernels to sum for multi-kernel MMD (default=5)")
     parser.add_argument("--mmd-kernel-mul", type=float, default=2.0, help="Geometric spacing factor between MMD kernel bandwidths (default=2.0)")
+    parser.add_argument("--mmd-weight", type=float, default=0.1, help="Static multiplier on MMD loss (default: 0.1; prevents MMD from overpowering regression MSE and triggering mode collapse)")
     parser.add_argument("--early-stop-patience", type=int, default=15, help="Stop if Val RMSE hasn't improved for this many epochs. Set to 0 to disable.")
     parser.add_argument("--rul-ceiling", type=float, default=DEFAULT_RUL_MAX_CEILING, help="Fixed physical RUL ceiling in cycles used for normalization (default=2500).")
     parser.add_argument("--norm-type", type=str, choices=["layernorm", "batchnorm"], default="layernorm", help="Normalization layer in predictor heads (default: layernorm, prevents cross-domain running statistics contamination; use batchnorm for paper Table 2 reproduction)")
@@ -566,6 +571,7 @@ def main():
         rul_ceiling=args.rul_ceiling,
         norm_type=args.norm_type,
         severson_only=args.severson_only,
+        mmd_weight=args.mmd_weight,
         device=device
     )
 

@@ -82,7 +82,7 @@ class MMDLoss(nn.Module):
         bandwidth_list = [bandwidth * (self.kernel_mul ** i) for i in range(self.kernel_num)]
 
         kernel_vals = [torch.exp(-l2_distance / bw) for bw in bandwidth_list]
-        return sum(kernel_vals)
+        return sum(kernel_vals) / float(self.kernel_num)
 
     def forward(self, source: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
