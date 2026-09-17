@@ -378,8 +378,10 @@ def train_hybrido_session(
         "test_raw_mape": final_test_raw_mape,
         "test_mape": final_test_paper_mape,
         "final_theta_s": float(model.theta_s.item()),
-        "final_theta_t": float(model.theta_t.item())
+        "final_theta_t": float(model.theta_t.item()),
+        "test_preds_unscaled": test_preds_unscaled
     }
+
 
 
 def run_benchmark(
@@ -397,12 +399,17 @@ def run_benchmark(
     norm_type: str = "layernorm",
     severson_only: bool = False,
     mmd_weight: float = 0.1,
+    seed: int = 42,
+    num_runs: int = 1,
     device: str = "cpu"
 ):
     """
     Zero-Leakage Cell-Level Partitioned Benchmark Run (Table 2 Specs):
     Source: 90% Training Cells / 10% Validation Cells.
     Target: 60% Adaptation Cells / 40% Blind Testing Cells.
+
+    Supports multi-seed repetitions (--num-runs N) with ensemble averaging
+    exactly as specified in Tran et al. 2025 Section 4.1.
     """
     logger.info(f"Loading Source: {source_npz}")
     src_data = np.load(source_npz)
@@ -431,7 +438,7 @@ def run_benchmark(
         )
     X_tgt_raw, Y_tgt_raw, tgt_cells = tgt_data["X"], tgt_data["Y"], tgt_data["cell_ids"]
 
-    # 1. Zero-Leakage Cell-Level Splitting
+    # 1. Zero-Leakage Cell-Level Splitting (Fixed seed 42 for cell-split consistency across runs)
     X_tr_raw, X_val_raw, Y_tr_raw, Y_val_raw, tr_c, val_c = split_by_cell_id(
         X_src_raw, Y_src_raw, src_cells, test_ratio=val_ratio, random_state=42
     )
@@ -473,45 +480,127 @@ def run_benchmark(
     tgt_loader = DataLoader(BatteryDataset(X_tgt_ad_sc, Y_tgt_ad_sc), batch_size=batch_size, shuffle=True, drop_last=drop_tgt)
     tgt_test_loader = DataLoader(BatteryDataset(X_tgt_ts_sc, Y_tgt_ts_sc), batch_size=batch_size, shuffle=False)
 
-    # Model instantiation with published Table 2 dimensions (hidden_dim=128)
-    logger.info(f"Instantiating HybridoNetAdapt (norm_type='{norm_type}')")
-    model = HybridoNetAdapt(
-        input_dim=18,
-        hidden_dim=128,
-        num_lstm_layers=2,
-        num_heads=4,
-        dropout=0.1,
-        norm_type=norm_type
-    )
+    if num_runs <= 1:
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        logger.info(f"Instantiating HybridoNetAdapt (norm_type='{norm_type}', seed={seed})")
+        model = HybridoNetAdapt(
+            input_dim=18,
+            hidden_dim=128,
+            num_lstm_layers=2,
+            num_heads=4,
+            dropout=0.1,
+            norm_type=norm_type
+        )
+        results = train_hybrido_session(
+            model=model,
+            source_loader=src_loader,
+            target_loader=tgt_loader,
+            val_loader=val_loader,
+            target_test_loader=tgt_test_loader,
+            target_y_test_raw=Y_tgt_test,
+            val_y_raw=Y_val_raw,
+            scaler_y=scaler_y,
+            epochs=epochs,
+            lr=lr,
+            sigma_mmd=sigma_mmd,
+            mmd_kernel_num=mmd_kernel_num,
+            mmd_kernel_mul=mmd_kernel_mul,
+            mmd_weight=mmd_weight,
+            early_stop_patience=early_stop_patience,
+            device=device
+        )
+        logger.info("\n" + "=" * 50)
+        logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
+        logger.info(f"Target Test RMSE:        {results['test_rmse']:.2f} cycles")
+        logger.info(f"Target Test R²:          {results['test_r2']:.4f}")
+        logger.info(f"Paper MAPE (vs EOL):     {results['test_paper_mape']:.2f}%")
+        logger.info(f"Floor MAPE (RUL >= 50):  {results['test_floor_mape']:.2f}%")
+        logger.info(f"Raw MAPE (unbounded):    {results['test_raw_mape']:.2f}%")
+        logger.info(f"Trained Trade-off Weights: theta_S={results['final_theta_s']:.4f}, theta_T={results['final_theta_t']:.4f}")
+        logger.info("=" * 50)
+        return results
+    else:
+        logger.info("\n" + "=" * 60)
+        logger.info(f"RUNNING MULTI-SEED BENCHMARK ({num_runs} REPETITIONS, PAPER SECTION 4.1)")
+        logger.info("=" * 60)
+        all_results = []
+        all_test_preds = []
+        for run_idx in range(num_runs):
+            current_seed = seed + run_idx
+            torch.manual_seed(current_seed)
+            np.random.seed(current_seed)
+            logger.info(f"\n{'='*20} RUN [{run_idx + 1:02d}/{num_runs:02d}] (Seed: {current_seed}) {'='*20}")
+            model = HybridoNetAdapt(
+                input_dim=18,
+                hidden_dim=128,
+                num_lstm_layers=2,
+                num_heads=4,
+                dropout=0.1,
+                norm_type=norm_type
+            )
+            res = train_hybrido_session(
+                model=model,
+                source_loader=src_loader,
+                target_loader=tgt_loader,
+                val_loader=val_loader,
+                target_test_loader=tgt_test_loader,
+                target_y_test_raw=Y_tgt_test,
+                val_y_raw=Y_val_raw,
+                scaler_y=scaler_y,
+                epochs=epochs,
+                lr=lr,
+                sigma_mmd=sigma_mmd,
+                mmd_kernel_num=mmd_kernel_num,
+                mmd_kernel_mul=mmd_kernel_mul,
+                mmd_weight=mmd_weight,
+                early_stop_patience=early_stop_patience,
+                device=device
+            )
+            all_results.append(res)
+            all_test_preds.append(res["test_preds_unscaled"])
 
-    results = train_hybrido_session(
-        model=model,
-        source_loader=src_loader,
-        target_loader=tgt_loader,
-        val_loader=val_loader,
-        target_test_loader=tgt_test_loader,
-        target_y_test_raw=Y_tgt_test,
-        val_y_raw=Y_val_raw,
-        scaler_y=scaler_y,
-        epochs=epochs,
-        lr=lr,
-        sigma_mmd=sigma_mmd,
-        mmd_kernel_num=mmd_kernel_num,
-        mmd_kernel_mul=mmd_kernel_mul,
-        mmd_weight=mmd_weight,
-        early_stop_patience=early_stop_patience,
-        device=device
-    )
+        rmses = np.array([r["test_rmse"] for r in all_results])
+        r2s = np.array([r["test_r2"] for r in all_results])
+        paper_mapes = np.array([r["test_paper_mape"] for r in all_results])
+        floor_mapes = np.array([r["test_floor_mape"] for r in all_results])
 
-    logger.info("\n" + "=" * 50)
-    logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
-    logger.info(f"Target Test RMSE:        {results['test_rmse']:.2f} cycles")
-    logger.info(f"Target Test R²:          {results['test_r2']:.4f}")
-    logger.info(f"Paper MAPE (vs EOL):     {results['test_paper_mape']:.2f}%")
-    logger.info(f"Floor MAPE (RUL >= 50):  {results['test_floor_mape']:.2f}%")
-    logger.info(f"Raw MAPE (unbounded):    {results['test_raw_mape']:.2f}%")
-    logger.info(f"Trained Trade-off Weights: theta_S={results['final_theta_s']:.4f}, theta_T={results['final_theta_t']:.4f}")
-    logger.info("=" * 50)
+        # Exact Paper Methodology: Ensemble-averaged prediction across the runs
+        ens_preds = np.mean(all_test_preds, axis=0)
+        ens_rmse = float(np.sqrt(mean_squared_error(Y_tgt_test, ens_preds)))
+        ens_r2 = float(r2_score(Y_tgt_test, ens_preds))
+        target_nominal_life = float(np.max(Y_tgt_test))
+        ens_paper_mape = float(np.mean(np.abs(Y_tgt_test - ens_preds) / max(target_nominal_life, 1.0)) * 100.0)
+        mask_floor = Y_tgt_test >= 50.0
+        ens_floor_mape = float(mean_absolute_percentage_error(Y_tgt_test[mask_floor], ens_preds[mask_floor]) * 100.0) if np.any(mask_floor) else float("nan")
+
+        logger.info("\n" + "=" * 60)
+        logger.info(f"HYBRIDONET-ADAPT MULTI-SEED RESULTS ({num_runs} RUNS)")
+        logger.info("=" * 60)
+        logger.info(f"Individual Runs (Mean ± Std):")
+        logger.info(f"  Test RMSE:          {np.mean(rmses):.2f} ± {np.std(rmses):.2f} cycles")
+        logger.info(f"  Test R²:            {np.mean(r2s):.4f} ± {np.std(r2s):.4f}")
+        logger.info(f"  Paper MAPE:         {np.mean(paper_mapes):.2f}% ± {np.std(paper_mapes):.2f}%")
+        logger.info(f"  Floor MAPE (>=50):  {np.mean(floor_mapes):.2f}% ± {np.std(floor_mapes):.2f}%")
+        logger.info("-" * 60)
+        logger.info(f"Ensemble-Averaged Prediction (Published Paper Methodology):")
+        logger.info(f"  Ensemble Test RMSE:         {ens_rmse:.2f} cycles")
+        logger.info(f"  Ensemble Test R²:           {ens_r2:.4f}")
+        logger.info(f"  Ensemble Paper MAPE:        {ens_paper_mape:.2f}%")
+        logger.info(f"  Ensemble Floor MAPE (>=50): {ens_floor_mape:.2f}%")
+        logger.info("=" * 60)
+
+        return {
+            "mean_rmse": float(np.mean(rmses)),
+            "std_rmse": float(np.std(rmses)),
+            "mean_r2": float(np.mean(r2s)),
+            "std_r2": float(np.std(r2s)),
+            "mean_paper_mape": float(np.mean(paper_mapes)),
+            "ensemble_rmse": ens_rmse,
+            "ensemble_r2": ens_r2,
+            "ensemble_paper_mape": ens_paper_mape
+        }
+
 
 
 def resolve_file_path(path_str: str) -> str:
@@ -553,6 +642,8 @@ def main():
     parser.add_argument("--rul-ceiling", type=float, default=DEFAULT_RUL_MAX_CEILING, help="Fixed physical RUL ceiling in cycles used for normalization (default=2500).")
     parser.add_argument("--norm-type", type=str, choices=["layernorm", "batchnorm"], default="layernorm", help="Normalization layer in predictor heads (default: layernorm, prevents cross-domain running statistics contamination; use batchnorm for paper Table 2 reproduction)")
     parser.add_argument("--severson-only", action="store_true", help="Filter MATR dataset to the 124 cells from Severson et al. 2019 (batches 1-3), excluding Attia batch 4")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for model initialization and data splitting (default: 42)")
+    parser.add_argument("--num-runs", type=int, default=1, help="Number of repetitions to run (default: 1; paper Section 4.1 uses 10 runs with ensemble averaging)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -583,8 +674,11 @@ def main():
         norm_type=args.norm_type,
         severson_only=args.severson_only,
         mmd_weight=args.mmd_weight,
+        seed=args.seed,
+        num_runs=args.num_runs,
         device=device
     )
+
 
 
 if __name__ == "__main__":
