@@ -118,21 +118,33 @@ class FeatureExtractor(nn.Module):
 
 class Predictor(nn.Module):
     """
-    RUL Predictor Network (Table 2):
-    Linear layers [128 -> 64 -> 32 -> 1] with BatchNorm1d, Dropout(0.1), ReLU,
+    RUL Predictor Network:
+    Linear layers [128 -> 64 -> 32 -> 1] with Normalization, Dropout(0.1), ReLU,
     ending strictly with Sigmoid() activation.
+
+    Supports:
+    - 'layernorm' (DEFAULT, recommended): Immune to cross-domain batch statistic contamination.
+      Normalizes per-sample with zero running statistics, preventing post-epoch-5 Sigmoid saturation.
+    - 'batchnorm': Original Table 2 implementation using nn.BatchNorm1d.
     """
 
-    def __init__(self, in_features: int = 128, dropout: float = 0.1):
+    def __init__(self, in_features: int = 128, dropout: float = 0.1, norm_type: str = "layernorm"):
         super().__init__()
+        if norm_type == "batchnorm":
+            norm1 = nn.BatchNorm1d(64)
+            norm2 = nn.BatchNorm1d(32)
+        else:
+            norm1 = nn.LayerNorm(64)
+            norm2 = nn.LayerNorm(32)
+
         self.net = nn.Sequential(
             nn.Linear(in_features, 64),
             nn.ReLU(),
-            nn.BatchNorm1d(64),
+            norm1,
             nn.Dropout(dropout),
             nn.Linear(64, 32),
             nn.ReLU(),
-            nn.BatchNorm1d(32),
+            norm2,
             nn.Dropout(dropout),
             nn.Linear(32, 1),
             nn.Sigmoid()
@@ -167,7 +179,8 @@ class HybridoNetAdapt(nn.Module):
         num_lstm_layers: int = 2,
         num_heads: int = 4,
         dropout: float = 0.1,
-        ode_block: Optional[nn.Module] = None
+        ode_block: Optional[nn.Module] = None,
+        norm_type: str = "layernorm"
     ):
         super().__init__()
 
@@ -182,8 +195,8 @@ class HybridoNetAdapt(nn.Module):
         )
 
         # Dual Predictors G_Y^S and G_Y^T (128 -> 64 -> 32 -> 1)
-        self.source_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
-        self.target_predictor = Predictor(in_features=hidden_dim, dropout=dropout)
+        self.source_predictor = Predictor(in_features=hidden_dim, dropout=dropout, norm_type=norm_type)
+        self.target_predictor = Predictor(in_features=hidden_dim, dropout=dropout, norm_type=norm_type)
 
         # Trainable Trade-Off Parameters, constrained to a convex combination via
         # softmax(theta_logits) -> (theta_s, theta_t), theta_s + theta_t == 1.

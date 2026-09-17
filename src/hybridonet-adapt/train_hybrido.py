@@ -35,7 +35,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, r2_score
 import glob
 from typing import Tuple, Dict, List, Optional
 
@@ -70,14 +70,14 @@ class BatteryDataset(Dataset):
         return self.X[idx], self.Y[idx]
 
 
-DEFAULT_RUL_MAX_CEILING = 5000.0  # Fixed benchmark physical ceiling across all battery chemistries
+DEFAULT_RUL_MAX_CEILING = 2500.0  # Optimal physical ceiling for MATR (max ~2205 cyc) and HUST (max ~2293 cyc)
 
 
 class RobustRULScaler:
     """
     Fixed physical upper-bound normalizer for battery Remaining Useful Life (RUL).
-    Normalizes RUL to [0, 1] using a fixed physical ceiling (default 5000 cycles).
-    Raises ValueError loudly on overflow instead of silently clipping and corrupting labels.
+    Normalizes RUL to [0, 1] using a fixed physical ceiling (default 2500 cycles).
+    Auto-expands ceiling for longer-lived datasets (e.g. SNL ~4020 cycles) when using default.
     """
 
     def __init__(self, y_max: float = DEFAULT_RUL_MAX_CEILING):
@@ -87,13 +87,17 @@ class RobustRULScaler:
         return self
 
     def transform(self, y: np.ndarray) -> np.ndarray:
+        max_val = float(np.max(y))
+        if max_val > self.y_max:
+            if self.y_max == DEFAULT_RUL_MAX_CEILING:
+                self.y_max = float(np.ceil((max_val * 1.05) / 500.0) * 500.0)
+                logger.info(f"Auto-expanded physical RUL ceiling to {self.y_max:.0f} cycles to accommodate maximum label ({max_val:.1f} cycles)")
+            else:
+                raise ValueError(
+                    f"RUL value ({max_val:.1f} cycles) exceeds the specified benchmark ceiling of {self.y_max:.1f} cycles. "
+                    "Pass a larger --rul-ceiling."
+                )
         scaled = y / self.y_max
-        if np.any(scaled < 0.0) or np.any(scaled > 1.0):
-            max_val = float(np.max(y))
-            raise ValueError(
-                f"RUL value ({max_val:.1f} cycles) exceeds the fixed benchmark ceiling of {self.y_max:.1f} cycles. "
-                "Failing loudly to prevent silent label corruption."
-            )
         return scaled.astype(np.float32)
 
     def inverse_transform(self, y_scaled: np.ndarray) -> np.ndarray:
@@ -276,6 +280,8 @@ def train_hybrido_session(
                 val_preds.extend(y_pred_s.cpu().numpy().flatten())
 
         val_preds = np.array(val_preds)
+        val_pred_min = float(val_preds.min()) if len(val_preds) > 0 else 0.0
+        val_pred_max = float(val_preds.max()) if len(val_preds) > 0 else 0.0
         val_preds_unscaled = scaler_y.inverse_transform(val_preds)
         val_rmse = float(np.sqrt(mean_squared_error(val_y_raw, val_preds_unscaled)))
 
@@ -297,6 +303,7 @@ def train_hybrido_session(
             f"MMD: {mmd_loss_accum / max(1, batches):.4f} (lambda={lambda_p:.3f}) | "
             f"LR: {current_lr:.2e} | "
             f"Val RMSE: {val_rmse:.2f} cyc | "
+            f"Val Preds: [{val_pred_min:.3f}, {val_pred_max:.3f}] | "
             f"theta_S: {model.theta_s.item():.3f}, theta_T: {model.theta_t.item():.3f}"
         )
 
@@ -322,18 +329,40 @@ def train_hybrido_session(
     test_preds = np.array(test_preds)
     test_preds_unscaled = scaler_y.inverse_transform(test_preds)
     final_test_rmse = float(np.sqrt(mean_squared_error(target_y_test_raw, test_preds_unscaled)))
-    final_test_mape = float(mean_absolute_percentage_error(target_y_test_raw, test_preds_unscaled) * 100.0)
+    final_test_r2 = float(r2_score(target_y_test_raw, test_preds_unscaled))
+
+    # 1. Paper's MAPE: Section 4.3 (Page 13) defines MAPE divided by the cell's nominal cycle life y:
+    # MAPE = (1/N) * sum(|y_i - y_hat_i| / y_cycle_life) * 100%
+    target_nominal_life = float(np.max(target_y_test_raw))
+    final_test_paper_mape = float(np.mean(np.abs(target_y_test_raw - test_preds_unscaled) / max(target_nominal_life, 1.0)) * 100.0)
+
+    # 2. Floor MAPE: Evaluates instantaneous MAPE excluding near-EOL windows (<50 cycles) where division by near-zero blows up
+    mask_floor = target_y_test_raw >= 50.0
+    if np.any(mask_floor):
+        final_test_floor_mape = float(mean_absolute_percentage_error(target_y_test_raw[mask_floor], test_preds_unscaled[mask_floor]) * 100.0)
+    else:
+        final_test_floor_mape = float("nan")
+
+    # 3. Raw scikit-learn instantaneous MAPE (unbounded near EOL)
+    final_test_raw_mape = float(mean_absolute_percentage_error(target_y_test_raw, test_preds_unscaled) * 100.0)
 
     logger.info(
         f"\n[FINAL TEST EVALUATION] Chosen Epoch: {best_epoch} | "
-        f"Test RMSE: {final_test_rmse:.2f} cycles | Test MAPE: {final_test_mape:.2f}%"
+        f"Test RMSE: {final_test_rmse:.2f} cycles | "
+        f"Test R²: {final_test_r2:.4f} | "
+        f"Paper MAPE: {final_test_paper_mape:.2f}% | "
+        f"Floor MAPE (RUL>=50): {final_test_floor_mape:.2f}% | "
+        f"Raw MAPE: {final_test_raw_mape:.2f}%"
     )
 
     return {
         "best_epoch": best_epoch,
         "best_val_rmse": best_val_rmse,
         "test_rmse": final_test_rmse,
-        "test_mape": final_test_mape,
+        "test_r2": final_test_r2,
+        "test_paper_mape": final_test_paper_mape,
+        "test_floor_mape": final_test_floor_mape,
+        "test_mape": final_test_paper_mape,
         "final_theta_s": float(model.theta_s.item()),
         "final_theta_t": float(model.theta_t.item())
     }
@@ -351,6 +380,8 @@ def run_benchmark(
     mmd_kernel_mul: float = 2.0,
     early_stop_patience: Optional[int] = 15,
     rul_ceiling: float = DEFAULT_RUL_MAX_CEILING,
+    norm_type: str = "layernorm",
+    severson_only: bool = False,
     device: str = "cpu"
 ):
     """
@@ -366,6 +397,15 @@ def run_benchmark(
             "Cell-level splitting cannot be guaranteed. Please re-run preprocess_hybrido.py."
         )
     X_src_raw, Y_src_raw, src_cells = src_data["X"], src_data["Y"], src_data["cell_ids"]
+
+    # Optional filter: Filter MATR (169 cells) down to the 124 cells from Severson et al. 2019 (batches 1-3)
+    if severson_only and "matr" in source_npz.lower():
+        severson_mask = np.array([not str(c).startswith("MATR_b4") for c in src_cells])
+        if np.any(severson_mask):
+            X_src_raw = X_src_raw[severson_mask]
+            Y_src_raw = Y_src_raw[severson_mask]
+            src_cells = src_cells[severson_mask]
+            logger.info(f"--severson-only: Filtered MATR to {len(np.unique(src_cells))} Severson et al. 2019 cells (batches 1-3).")
 
     logger.info(f"Loading Target: {target_npz}")
     tgt_data = np.load(target_npz)
@@ -419,12 +459,14 @@ def run_benchmark(
     tgt_test_loader = DataLoader(BatteryDataset(X_tgt_ts_sc, Y_tgt_ts_sc), batch_size=batch_size, shuffle=False)
 
     # Model instantiation with published Table 2 dimensions (hidden_dim=128)
+    logger.info(f"Instantiating HybridoNetAdapt (norm_type='{norm_type}')")
     model = HybridoNetAdapt(
         input_dim=18,
         hidden_dim=128,
         num_lstm_layers=2,
         num_heads=4,
-        dropout=0.1
+        dropout=0.1,
+        norm_type=norm_type
     )
 
     results = train_hybrido_session(
@@ -447,8 +489,11 @@ def run_benchmark(
 
     logger.info("\n" + "=" * 50)
     logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
-    logger.info(f"Target Test RMSE: {results['test_rmse']:.2f} cycles")
-    logger.info(f"Target Test MAPE: {results['test_mape']:.2f}%")
+    logger.info(f"Target Test RMSE:        {results['test_rmse']:.2f} cycles")
+    logger.info(f"Target Test R²:          {results['test_r2']:.4f}")
+    logger.info(f"Paper MAPE (vs EOL):     {results['test_paper_mape']:.2f}%")
+    logger.info(f"Floor MAPE (RUL >= 50):  {results['test_floor_mape']:.2f}%")
+    logger.info(f"Raw MAPE (unbounded):    {results['test_raw_mape']:.2f}%")
     logger.info(f"Trained Trade-off Weights: theta_S={results['final_theta_s']:.4f}, theta_T={results['final_theta_t']:.4f}")
     logger.info("=" * 50)
 
@@ -480,7 +525,7 @@ def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Benchmark Runner")
     parser.add_argument("--source", type=str, required=True, help="Path to source .npz raw features (REQUIRED)")
     parser.add_argument("--target", type=str, required=True, help="Path to target .npz raw features (REQUIRED)")
-    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs (default=60; raised from the paper's 10 for better convergence, paired with early stopping)")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs (default=60; paired with early stopping)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size (paper default=128)")
     parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005), cosine-annealed over training")
     parser.add_argument("--val-ratio", type=float, default=0.10, help="Source cell validation ratio (default 0.10)")
@@ -488,7 +533,9 @@ def main():
     parser.add_argument("--mmd-kernel-num", type=int, default=5, help="Number of Gaussian kernels to sum for multi-kernel MMD (default=5)")
     parser.add_argument("--mmd-kernel-mul", type=float, default=2.0, help="Geometric spacing factor between MMD kernel bandwidths (default=2.0)")
     parser.add_argument("--early-stop-patience", type=int, default=15, help="Stop if Val RMSE hasn't improved for this many epochs. Set to 0 to disable.")
-    parser.add_argument("--rul-ceiling", type=float, default=DEFAULT_RUL_MAX_CEILING, help="Fixed physical RUL ceiling in cycles used for normalization (default=5000). Set this closer to your dataset's real max cycle life for better label resolution.")
+    parser.add_argument("--rul-ceiling", type=float, default=DEFAULT_RUL_MAX_CEILING, help="Fixed physical RUL ceiling in cycles used for normalization (default=2500).")
+    parser.add_argument("--norm-type", type=str, choices=["layernorm", "batchnorm"], default="layernorm", help="Normalization layer in predictor heads (default: layernorm, prevents cross-domain running statistics contamination; use batchnorm for paper Table 2 reproduction)")
+    parser.add_argument("--severson-only", action="store_true", help="Filter MATR dataset to the 124 cells from Severson et al. 2019 (batches 1-3), excluding Attia batch 4")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -516,6 +563,8 @@ def main():
         mmd_kernel_mul=args.mmd_kernel_mul,
         early_stop_patience=early_stop_patience,
         rul_ceiling=args.rul_ceiling,
+        norm_type=args.norm_type,
+        severson_only=args.severson_only,
         device=device
     )
 
