@@ -158,26 +158,37 @@ def fit_and_transform_features_18d(
     """
     Fits MinMaxScaler across all samples and time steps over the 18 physical feature dimensions.
     X shape: (N, 10, 3, 6) -> (N*10, 18) for scaling.
-    """
 
+    ACCURACY FIX: Fits on BOTH training splits: source train + target adaptation.
+    This is not leakage: the blind target test split is strictly excluded and only transformed.
+    Includes clipping to [-0.5, 1.5] as a safety net against near-zero range denominator blow-up.
+    """
     def to_flat18(arr):
         n, s, c, f = arr.shape
         return arr.reshape(n * s, c * f), (n, s, c, f)
 
-    X_tr_flat, orig_shape_tr = to_flat18(X_train)
+    X_tr_flat, shape_tr = to_flat18(X_train)
+    X_ad_flat, shape_ad = to_flat18(X_tgt_adapt)
+
+    # Fit on BOTH training splits: source train + target adaptation.
+    # Not leakage — the blind test split is never used for fitting.
     scaler = MinMaxScaler(feature_range=(0.0, 1.0))
-    X_tr_sc = scaler.fit_transform(X_tr_flat).reshape(orig_shape_tr)
+    scaler.fit(np.vstack([X_tr_flat, X_ad_flat]))
 
-    X_val_flat, orig_shape_val = to_flat18(X_val)
-    X_val_sc = scaler.transform(X_val_flat).reshape(orig_shape_val)
+    def tf(flat, shape):
+        return np.clip(scaler.transform(flat), -0.5, 1.5).reshape(shape).astype(np.float32)
 
-    X_tgt_ad_flat, orig_shape_ad = to_flat18(X_tgt_adapt)
-    X_tgt_ad_sc = scaler.transform(X_tgt_ad_flat).reshape(orig_shape_ad)
+    X_val_flat, shape_val = to_flat18(X_val)
+    X_ts_flat, shape_ts = to_flat18(X_tgt_test)
 
-    X_tgt_ts_flat, orig_shape_ts = to_flat18(X_tgt_test)
-    X_tgt_ts_sc = scaler.transform(X_tgt_ts_flat).reshape(orig_shape_ts)
+    return (
+        tf(X_tr_flat, shape_tr),
+        tf(X_val_flat, shape_val),
+        tf(X_ad_flat, shape_ad),
+        tf(X_ts_flat, shape_ts),
+        scaler
+    )
 
-    return X_tr_sc, X_val_sc, X_tgt_ad_sc, X_tgt_ts_sc, scaler
 
 
 def train_hybrido_session(
