@@ -208,8 +208,10 @@ def train_hybrido_session(
     mmd_weight: float = 0.1,
     grad_clip_norm: float = 5.0,
     early_stop_patience: Optional[int] = 15,
+    checkpoint_path: Optional[str] = "checkpoints/hybrido_best.pt",
     device: str = "cpu"
 ) -> Dict[str, float]:
+
     """
     Paper-faithful training loop with validation-driven checkpoint selection and
     constrained trainable theta parameters.
@@ -330,6 +332,17 @@ def train_hybrido_session(
     # FINAL EVALUATION: Load best checkpoint chosen by validation, test target set EXACTLY ONCE
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
+        if checkpoint_path is not None:
+            ckpt_dir = os.path.dirname(checkpoint_path)
+            if ckpt_dir:
+                os.makedirs(ckpt_dir, exist_ok=True)
+            torch.save({
+                "state_dict": best_model_state,
+                "best_epoch": best_epoch,
+                "best_val_rmse": best_val_rmse
+            }, checkpoint_path)
+            logger.info(f"Saved best model checkpoint to {checkpoint_path}")
+
 
     model.eval()
     test_preds = []
@@ -384,6 +397,21 @@ def train_hybrido_session(
 
 
 
+def filter_severson_cells(
+    X: np.ndarray,
+    Y: np.ndarray,
+    cell_ids: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Filters MATR dataset (169 cells) down to the 124 cells from Severson et al. 2019
+    (batches 1-3) by excluding Attia et al. 2020 batch 4 cells ('b4c*' and '*_b4*').
+    """
+    severson_mask = np.array(["b4c" not in str(c).lower() and "_b4" not in str(c).lower() for c in cell_ids])
+    if np.any(severson_mask):
+        return X[severson_mask], Y[severson_mask], cell_ids[severson_mask]
+    return X, Y, cell_ids
+
+
 def run_benchmark(
     source_npz: str,
     target_npz: str,
@@ -399,6 +427,7 @@ def run_benchmark(
     norm_type: str = "layernorm",
     severson_only: bool = False,
     mmd_weight: float = 0.1,
+    checkpoint_path: str = "checkpoints/hybrido_best.pt",
     seed: int = 42,
     num_runs: int = 1,
     device: str = "cpu"
@@ -422,12 +451,8 @@ def run_benchmark(
 
     # Optional filter: Filter MATR (169 cells) down to the 124 cells from Severson et al. 2019 (batches 1-3)
     if severson_only and "matr" in source_npz.lower():
-        severson_mask = np.array(["b4c" not in str(c).lower() and "_b4" not in str(c).lower() for c in src_cells])
-        if np.any(severson_mask):
-            X_src_raw = X_src_raw[severson_mask]
-            Y_src_raw = Y_src_raw[severson_mask]
-            src_cells = src_cells[severson_mask]
-            logger.info(f"--severson-only: Filtered MATR to {len(np.unique(src_cells))} Severson et al. 2019 cells (batches 1-3).")
+        X_src_raw, Y_src_raw, src_cells = filter_severson_cells(X_src_raw, Y_src_raw, src_cells)
+        logger.info(f"--severson-only: Filtered MATR to {len(np.unique(src_cells))} Severson et al. 2019 cells (batches 1-3).")
 
     logger.info(f"Loading Target: {target_npz}")
     tgt_data = np.load(target_npz)
@@ -508,6 +533,7 @@ def run_benchmark(
             mmd_kernel_mul=mmd_kernel_mul,
             mmd_weight=mmd_weight,
             early_stop_patience=early_stop_patience,
+            checkpoint_path=checkpoint_path,
             device=device
         )
         logger.info("\n" + "=" * 50)
@@ -539,6 +565,10 @@ def run_benchmark(
                 dropout=0.1,
                 norm_type=norm_type
             )
+            run_ckpt = checkpoint_path
+            if checkpoint_path and num_runs > 1:
+                base, ext = os.path.splitext(checkpoint_path)
+                run_ckpt = f"{base}_run{run_idx + 1}{ext}"
             res = train_hybrido_session(
                 model=model,
                 source_loader=src_loader,
@@ -555,8 +585,10 @@ def run_benchmark(
                 mmd_kernel_mul=mmd_kernel_mul,
                 mmd_weight=mmd_weight,
                 early_stop_patience=early_stop_patience,
+                checkpoint_path=run_ckpt,
                 device=device
             )
+
             all_results.append(res)
             all_test_preds.append(res["test_preds_unscaled"])
 
@@ -644,6 +676,7 @@ def main():
     parser.add_argument("--severson-only", action="store_true", help="Filter MATR dataset to the 124 cells from Severson et al. 2019 (batches 1-3), excluding Attia batch 4")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for model initialization and data splitting (default: 42)")
     parser.add_argument("--num-runs", type=int, default=1, help="Number of repetitions to run (default: 1; paper Section 4.1 uses 10 runs with ensemble averaging)")
+    parser.add_argument("--checkpoint-path", type=str, default="checkpoints/hybrido_best.pt", help="Path to save the best model checkpoint (default: checkpoints/hybrido_best.pt)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -674,10 +707,12 @@ def main():
         norm_type=args.norm_type,
         severson_only=args.severson_only,
         mmd_weight=args.mmd_weight,
+        checkpoint_path=args.checkpoint_path,
         seed=args.seed,
         num_runs=args.num_runs,
         device=device
     )
+
 
 
 
