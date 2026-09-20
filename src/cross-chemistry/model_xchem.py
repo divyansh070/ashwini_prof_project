@@ -1,0 +1,249 @@
+#!/usr/bin/env python3
+"""
+HybridoNet-Adapt Cross-Chemistry Model Architecture (Stage 0).
+
+Inherits the verified paper-faithful architecture (Tran et al., 2025):
+- 2-layer LSTM temporal feature encoder
+- Multihead Attention (embed_dim=128) with last timestep (-1) selection
+- Neural ODE (NODE) continuous latent evolution evaluated with RK4
+- Post-NODE LayerNorm
+- Dual predictors (source head and target head) with LayerNorm/BatchNorm support
+- Constrained trade-off weights via softmax(theta_logits): theta_s + theta_t == 1
+
+Genuinely configurable input_dim:
+Requires `input_dim` as an explicit parameter (no default) to support
+18-D (Arm A), 30-D (Arm B: Q,I deltas), and 36-D (Arm C: all deltas).
+"""
+
+import torch
+import torch.nn as nn
+from typing import Tuple, Optional
+
+
+class ODEFunc(nn.Module):
+    """
+    Derivative function dz/dt = f(z, t).
+    Faithful to paper: f is realized as a single linear layer: dz/dt = W*z + b.
+    """
+
+    def __init__(self, hidden_dim: int = 128):
+        super().__init__()
+        self.linear = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, t: float, z: torch.Tensor) -> torch.Tensor:
+        return self.linear(z)
+
+
+class NeuralODEBlock(nn.Module):
+    """
+    Modular Neural Ordinary Differential Equation (NODE) Block.
+    Integrates hidden state trajectory over continuous time using Runge-Kutta 4 (RK4).
+    Evaluates at continuous integration step (t=2 / 2 integration steps).
+    """
+
+    def __init__(self, hidden_dim: int = 128, num_steps: int = 2):
+        super().__init__()
+        self.ode_func = ODEFunc(hidden_dim)
+        self.num_steps = num_steps
+
+    def _rk4_step(self, f: nn.Module, t: float, z: torch.Tensor, dt: float) -> torch.Tensor:
+        k1 = f(t, z)
+        k2 = f(t + dt / 2.0, z + dt / 2.0 * k1)
+        k3 = f(t + dt / 2.0, z + dt / 2.0 * k2)
+        k4 = f(t + dt, z + dt * k3)
+        return z + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        dt = 1.0 / max(1, self.num_steps)
+        t = 0.0
+        for _ in range(self.num_steps):
+            z = self._rk4_step(self.ode_func, t, z, dt)
+            t += dt
+        return z
+
+
+class FeatureExtractor(nn.Module):
+    """
+    HybridoNet Feature Extractor:
+    1. 2-layer LSTM (input_dim -> hidden_dim=128)
+    2. Multihead Attention (embed_dim=128) + LayerNorm
+    3. Last attention timestep selection (h_{t=-1})
+    4. Neural ODE (NODE) continuous dynamics block (128 -> 128)
+    5. Post-NODE LayerNorm (128 -> 128)
+
+    NOTE: input_dim is a REQUIRED parameter with NO default to prevent
+    accidental dimensional mismatch across 18-D, 30-D, and 36-D arms.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 128,
+        num_lstm_layers: int = 2,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        ode_block: Optional[nn.Module] = None
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+
+        # 1. Two-layer LSTM (10 x input_dim -> 10 x 128)
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            dropout=dropout if num_lstm_layers > 1 else 0.0
+        )
+
+        # 2. Multihead Attention (Scaled Dot-Product, embed_dim=128)
+        self.mha = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        # 3. Modular Neural ODE Block (128 -> 128)
+        self.node = ode_block if ode_block is not None else NeuralODEBlock(hidden_dim=hidden_dim, num_steps=2)
+
+        # 4. LayerNorm directly following NODE block
+        self.node_layer_norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input x: (Batch, Seq_Len=10, Channels=3, Features=6) or (Batch, 10, input_dim)
+        Output: Latent state z (Batch, 128)
+        """
+        if x.dim() == 4:
+            b, s, c, f = x.shape
+            x = x.view(b, s, c * f)
+
+        # LSTM temporal feature encoding -> (B, S=10, 128)
+        lstm_out, _ = self.lstm(x)
+
+        # Multihead Attention with residual connection & LayerNorm
+        attn_out, _ = self.mha(lstm_out, lstm_out, lstm_out)
+        h = self.layer_norm(lstm_out + attn_out)  # (B, S=10, 128)
+
+        # Last timestep along time dimension
+        h_selected = h[:, -1, :]  # (B, 128)
+
+        # Continuous state evolution via Neural ODE + Post-NODE LayerNorm
+        z = self.node(h_selected)  # (B, 128)
+        z = self.node_layer_norm(z)  # (B, 128)
+        return z
+
+
+class Predictor(nn.Module):
+    """
+    RUL Predictor Network:
+    Linear layers [128 -> 64 -> 32 -> 1] with Normalization, Dropout(0.1), ReLU,
+    ending strictly with Sigmoid() activation.
+    """
+
+    def __init__(self, in_features: int = 128, dropout: float = 0.1, norm_type: str = "layernorm"):
+        super().__init__()
+        if norm_type == "batchnorm":
+            norm1 = nn.BatchNorm1d(64)
+            norm2 = nn.BatchNorm1d(32)
+        else:
+            norm1 = nn.LayerNorm(64)
+            norm2 = nn.LayerNorm(32)
+
+        self.net = nn.Sequential(
+            nn.Linear(in_features, 64),
+            nn.ReLU(),
+            norm1,
+            nn.Dropout(dropout),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            norm2,
+            nn.Dropout(dropout),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.net(z)
+
+
+class HybridoNetAdapt(nn.Module):
+    """
+    HybridoNet-Adapt Domain Adaptation Architecture for Battery RUL.
+
+    Target prediction formula:
+        Y_hat_T = theta_S * G_Y^S(G_F(X)) + theta_T * G_Y^T(G_F(X))
+
+    theta_S and theta_T are parameterized as a softmax over learnable logits:
+        theta_S + theta_T == 1, staying in (0, 1) throughout training.
+
+    NOTE: input_dim is REQUIRED with NO default.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int = 128,
+        num_lstm_layers: int = 2,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        ode_block: Optional[nn.Module] = None,
+        norm_type: str = "layernorm"
+    ):
+        super().__init__()
+
+        # Shared Feature Extractor G_F (128-D)
+        self.feature_extractor = FeatureExtractor(
+            input_dim=input_dim,
+            hidden_dim=hidden_dim,
+            num_lstm_layers=num_lstm_layers,
+            num_heads=num_heads,
+            dropout=dropout,
+            ode_block=ode_block
+        )
+
+        # Dual Predictors G_Y^S and G_Y^T (128 -> 64 -> 32 -> 1)
+        self.source_predictor = Predictor(in_features=hidden_dim, dropout=dropout, norm_type=norm_type)
+        self.target_predictor = Predictor(in_features=hidden_dim, dropout=dropout, norm_type=norm_type)
+
+        # Trainable Trade-Off Parameters constrained to convex combination via softmax
+        self.theta_logits = nn.Parameter(torch.zeros(2, dtype=torch.float32))
+
+    @property
+    def theta_weights(self) -> torch.Tensor:
+        """Softmax-normalized (theta_s, theta_t), always summing to 1."""
+        return torch.softmax(self.theta_logits, dim=0)
+
+    @property
+    def theta_s(self) -> torch.Tensor:
+        return self.theta_weights[0]
+
+    @property
+    def theta_t(self) -> torch.Tensor:
+        return self.theta_weights[1]
+
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extracts 128-dimensional feature embeddings z."""
+        return self.feature_extractor(x)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+
+        Returns:
+            y_hat_comb: Combined target prediction = theta_s * y_hat_s + theta_t * y_hat_t
+            y_hat_s: Source predictor output
+            y_hat_t: Target predictor output
+            z: Latent feature embedding
+        """
+        z = self.extract_features(x)
+        y_hat_s = self.source_predictor(z)
+        y_hat_t = self.target_predictor(z)
+
+        theta_s, theta_t = self.theta_s, self.theta_t
+        y_hat_comb = theta_s * y_hat_s + theta_t * y_hat_t
+
+        return y_hat_comb, y_hat_s, y_hat_t, z
