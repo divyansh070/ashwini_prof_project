@@ -123,12 +123,11 @@ class Predictor(nn.Module):
     ending strictly with Sigmoid() activation.
 
     Supports:
-    - 'layernorm' (DEFAULT, recommended): Immune to cross-domain batch statistic contamination.
-      Normalizes per-sample with zero running statistics, preventing post-epoch-5 Sigmoid saturation.
-    - 'batchnorm': Original Table 2 implementation using nn.BatchNorm1d.
+    - 'batchnorm' (DEFAULT, matching paper Table 2): nn.BatchNorm1d(64), nn.BatchNorm1d(32).
+    - 'layernorm': nn.LayerNorm per sample.
     """
 
-    def __init__(self, in_features: int = 128, dropout: float = 0.1, norm_type: str = "layernorm"):
+    def __init__(self, in_features: int = 128, dropout: float = 0.1, norm_type: str = "batchnorm"):
         super().__init__()
         if norm_type == "batchnorm":
             norm1 = nn.BatchNorm1d(64)
@@ -162,14 +161,9 @@ class HybridoNetAdapt(nn.Module):
     Target prediction formula:
         Y_hat_T = theta_S * G_Y^S(G_F(X)) + theta_T * G_Y^T(G_F(X))
 
-    ACCURACY FIX: theta_S and theta_T are now parameterized as a softmax over
-    two learnable logits (`theta_logits`) instead of two independent, free
-    scalars. This guarantees theta_S + theta_T == 1 and both weights stay in
-    (0, 1) throughout training, so the combination is always a genuine convex
-    trade-off between the source and target predictors instead of an
-    unconstrained linear combination that can drift to degenerate values
-    (e.g. large or negative weights) and hurt generalization on the target
-    test set.
+    theta_S and theta_T are parameterized as a softmax over
+    two learnable logits (`theta_logits`). This guarantees
+    theta_S + theta_T == 1 and both weights stay in (0, 1) throughout training.
     """
 
     def __init__(
@@ -180,7 +174,7 @@ class HybridoNetAdapt(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         ode_block: Optional[nn.Module] = None,
-        norm_type: str = "layernorm"
+        norm_type: str = "batchnorm"
     ):
         super().__init__()
 

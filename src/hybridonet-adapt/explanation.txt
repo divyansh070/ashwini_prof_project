@@ -1,0 +1,346 @@
+================================================================================
+           HYBRIDONET-ADAPT: CROSS-CHEMISTRY BATTERY RUL PREDICTION
+         COMPLETE PIPELINE EXPLANATION & ARCHITECTURAL REFERENCE
+================================================================================
+
+Paper Reference:
+  Tran et al. (2025), "HybridoNet-Adapt: A Hybrid Neural Network with Domain
+  Adaptation for Battery Remaining Useful Life Prediction", PLOS ONE.
+  DOI: 10.1371/journal.pone.0335066
+
+Target Cross-Domain Benchmark (Published Paper Table 2 & Section 4):
+  - RMSE: ~166.33 cycles (Best overall ~153.24 cycles)
+  - Coefficient of Determination (R²): ~0.86 (Best overall ~0.88)
+  - Mean Absolute Percentage Error (MAPE): ~7.44%
+
+
+TABLE OF CONTENTS
+--------------------------------------------------------------------------------
+1. Problem Formulation & Cross-Chemistry Adaptation Intuition
+2. Data Preprocessing & 18-D Feature Extraction Pipeline
+3. Disjoint Cell-Level Partitioning (Zero-Leakage Guarantee)
+4. Feature & RUL Normalization (Anti-Saturation Scaling)
+5. Deep Hybrid Neural Architecture (Stage-by-Stage Breakdown)
+   5.1 Two-Layer LSTM Temporal Feature Encoder
+   5.2 Multihead Scaled Dot-Product Self-Attention
+   5.3 Deterministic Attention Step Selection (h_{t=-1})
+   5.4 Neural Ordinary Differential Equation (NODE) Block (RK4 Solver)
+   5.5 Post-NODE Normalization
+   5.6 Dual Predictor Heads (Source Head G_Y^S & Target Head G_Y^T)
+   5.7 Softmax-Constrained Convex Trade-Off Formulation (theta_S, theta_T)
+6. Domain Adaptation via Multi-Kernel MMD & Dynamic Scheduling
+7. Training Loop & Optimization Mechanics
+   7.1 Pure Adam Optimizer & Fixed Learning Rate
+   7.2 Unified Combined Prediction Loss (Equation 13)
+   7.3 Validation-Driven Model Selection on Combined Output
+   7.4 Configured Schedule: 30 Epochs with Early Stopping Patience 8
+8. Evaluation Metrics Formulation
+9. Step-by-Step Execution Commands & Testing Instructions
+================================================================================
+
+
+1. PROBLEM FORMULATION & CROSS-CHEMISTRY ADAPTATION INTUITION
+--------------------------------------------------------------------------------
+Predicting the Remaining Useful Life (RUL) of lithium-ion batteries across
+differing chemistries (e.g., LFP vs. NCM/NCA) is notoriously difficult because
+electrochemical degradation trajectories vary widely:
+  - LFP cells exhibit a flat voltage plateau and gradual capacity fade over
+    thousands of cycles (e.g., MATR / Severson dataset: 1,000 - 2,500+ cycles).
+  - NCM cells show sloping voltage curves and degrade more rapidly under high
+    temperatures and C-rates (e.g., HUST dataset: 400 - 1,200 cycles).
+
+Standard supervised models trained on Source chemistry fail catastrophically
+when deployed directly on Target chemistry due to covariate shift in feature
+space. HybridoNet-Adapt addresses this by:
+  a) Extracting domain-invariant temporal-continuous latent representations
+     z in R^128 using an LSTM-MHA-NODE backbone.
+  b) Aligning latent distributions between source and target via Multi-Kernel
+     Maximum Mean Discrepancy (MK-MMD).
+  c) Learning dual regression heads (G_Y^S for source knowledge, G_Y^T for
+     target adaptation) and combining them via trainable trade-off parameters
+     (theta_S, theta_T).
+
+
+2. DATA PREPROCESSING & 18-D FEATURE EXTRACTION PIPELINE
+--------------------------------------------------------------------------------
+Script: preprocess_hybrido.py
+
+Input: Raw electrochemical cycling data (voltage V, current I, charge capacity Q,
+temperature T, time t).
+
+Step 2.1: Cycle-Level Statistical Feature Extraction
+For each cycle k, 6 summary statistics are calculated for each of 3 operational
+signals [Voltage, Current, Capacity]:
+  1. Mean:        mu = (1/M) * sum(x_m)
+  2. Std Dev:     sigma = sqrt( (1/M) * sum((x_m - mu)^2) )
+  3. Skewness:    gamma = (1/M) * sum( ((x_m - mu)/sigma)^3 )
+  4. Kurtosis:    kappa = (1/M) * sum( ((x_m - mu)/sigma)^4 ) - 3
+  5. Minimum:     min(x)
+  6. Maximum:     max(x)
+
+This yields a 3 x 6 = 18-dimensional feature vector per cycle:
+  x_k in R^18 = [
+    V_mean, V_std, V_skew, V_kurt, V_min, V_max,
+    I_mean, I_std, I_skew, I_kurt, I_min, I_max,
+    Q_mean, Q_std, Q_skew, Q_kurt, Q_min, Q_max
+  ]
+
+Step 2.2: Rolling Window Sampling
+Batteries are sampled across life using a rolling sliding window:
+  - Sequence length S = 10 consecutive cycles (e.g., cycles 21 to 30)
+  - Window step / stride = 30 cycles (or configurable)
+  - Sample tensor shape: (Batch, Seq_Len=10, Channels=3, Features=6) -> flattened
+    to (Batch, 10, 18) for LSTM consumption.
+
+Step 2.3: Rolling RUL Ground Truth Calculation
+At any sample ending at cycle C_end with end-of-life cycle EOL:
+  RUL_k = EOL - C_end
+This reflects the true remaining cycle capacity at observation time.
+
+
+3. DISJOINT CELL-LEVEL PARTITIONING (ZERO-LEAKAGE GUARANTEE)
+--------------------------------------------------------------------------------
+Script: train_hybrido.py -> split_by_cell_id()
+
+Crucial Machine Learning Safeguard:
+In time-series battery data, random window shuffling creates intra-battery data
+leakage (windows from cycle 30 and cycle 60 of the SAME physical cell ending up
+in train and test, inflating accuracy artificially).
+
+HybridoNet-Adapt enforces strict Cell-ID grouping:
+  - Source Domain (MATR):
+      * 90% unique physical cells -> Source Training set
+      * 10% unique physical cells -> Validation set (model checkpoint selection)
+  - Target Domain (HUST):
+      * 60% unique physical cells -> Target Adaptation set (unlabeled/labeled)
+      * 40% unique physical cells -> Blind Target Test set (never touched until final eval)
+
+Result: The test set consists entirely of unseen battery cells.
+
+
+4. FEATURE & RUL NORMALIZATION (ANTI-SATURATION SCALING)
+--------------------------------------------------------------------------------
+Classes: fit_and_transform_features_18d, RobustRULScaler
+
+Step 4.1: 18-D Feature Scaling
+A single Min-Max scaler is fitted ONLY on the Source Training windows across
+both sample and time dimensions:
+  X_scaled = (X - X_min) / (X_max - X_min + 1e-8)
+The same scaler transforms Source Val, Target Adaptation, and Target Test,
+preventing target information from leaking into feature scaling.
+
+Step 4.2: Robust Physical RUL Normalization
+The RUL targets are normalized to [0, 1] using a fixed physical ceiling
+(default 2500 cycles or dynamically matched to max life):
+  y_scaled = RUL / Y_MAX_CEILING
+  RUL_pred = y_pred_scaled * Y_MAX_CEILING
+
+This ensures targets do not saturate at 0 or 1, preserving strong gradient flow
+through the terminal Sigmoid activation in the predictor heads.
+
+
+5. DEEP HYBRID NEURAL ARCHITECTURE (STAGE-BY-STAGE BREAKDOWN)
+--------------------------------------------------------------------------------
+File: model_hybrido.py
+
+Input Tensor x: Shape (Batch, 10, 18)
+
+5.1 Two-Layer LSTM Temporal Feature Encoder (FeatureExtractor.lstm):
+  - Input: 18 features per cycle step
+  - Architecture: 2 stacked LSTM layers, hidden_size = 128
+  - Dropout: 0.1 between layers
+  - Output: H_lstm in R^(Batch, 10, 128)
+  - Role: Captures long-range electrochemical degradation trends across the 10 cycles.
+
+5.2 Multihead Scaled Dot-Product Self-Attention (FeatureExtractor.mha):
+  - Embed Dimension = 128, Heads = 4 (head dimension = 32)
+  - Attention formula: Attn(Q, K, V) = softmax(Q K^T / sqrt(32)) V
+  - Residual connection: H_attn = LayerNorm(H_lstm + Attn(H_lstm, H_lstm, H_lstm))
+  - Output: H_attn in R^(Batch, 10, 128)
+  - Role: Dynamically weighs the relative degradation importance of individual
+    cycles within the 10-cycle window.
+
+5.3 Deterministic Attention Step Selection (h_{t=-1}):
+  - As published in Tran et al. 2025, the model extracts the representation from
+    the LAST time step of the attention sequence:
+      h_selected = H_attn[:, -1, :] in R^(Batch, 128)
+  - Role: Encodes the most recent accumulated battery state into a fixed 128-D vector.
+
+5.4 Modular Neural Ordinary Differential Equation (NODE) Block:
+  - Class: NeuralODEBlock with ODEFunc(hidden_dim=128)
+  - Paper-faithful linear derivative: dz/dt = W * z + b (single Linear(128, 128))
+  - Numerical Integration: Runge-Kutta 4th Order (RK4) over continuous interval [0, 1]:
+      k1 = f(t, z)
+      k2 = f(t + dt/2, z + (dt/2)*k1)
+      k3 = f(t + dt/2, z + (dt/2)*k2)
+      k4 = f(t + dt, z + dt*k3)
+      z_{next} = z + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
+  - Number of integration steps: 2 (dt = 0.5)
+  - Role: Models continuous-time battery aging dynamics between discrete measurement
+    intervals, regularizing the latent trajectory against discrete sampling noise.
+
+5.5 Post-NODE Normalization (FeatureExtractor.node_layer_norm):
+  - LayerNorm(128) applied directly after the NODE integration output,
+    matching Table 2 of Tran et al. 2025.
+  - Produces latent embedding z in R^(Batch, 128).
+
+5.6 Dual Predictor Heads (Source Head G_Y^S & Target Head G_Y^T):
+  - Both heads share the exact Table 2 specification:
+      Linear(128 -> 64) -> ReLU() -> BatchNorm1d(64) -> Dropout(0.1) ->
+      Linear(64 -> 32)  -> ReLU() -> BatchNorm1d(32) -> Dropout(0.1) ->
+      Linear(32 -> 1)   -> Sigmoid()
+  - Output: Normalized RUL estimate in range (0, 1).
+  - Source Head G_Y^S: Retains degradation knowledge from abundant source data.
+  - Target Head G_Y^T: Specializes on target chemistry characteristics.
+
+5.7 Softmax-Constrained Convex Trade-Off Formulation (theta_S, theta_T):
+  - Target Prediction Formula:
+      Y_hat = theta_S * G_Y^S(z) + theta_T * G_Y^T(z)
+  - Parameterization:
+      theta_logits = nn.Parameter(torch.zeros(2))  # [0.0, 0.0]
+      [theta_S, theta_T] = softmax(theta_logits)
+  - Guarantees:
+      * theta_S + theta_T == 1.0 (strict convex combination)
+      * theta_S in (0, 1) and theta_T in (0, 1) at all times
+      * Unbiased initialization: starts at 0.5 / 0.5, allowing data gradients
+        to shift weight towards the more reliable head.
+
+
+6. DOMAIN ADAPTATION VIA MULTI-KERNEL MMD & DYNAMIC SCHEDULING
+--------------------------------------------------------------------------------
+File: mmd_loss.py -> MMDLoss
+
+Maximum Mean Discrepancy (MMD) measures the distance between the source latent
+distribution P(Z_S) and the target latent distribution Q(Z_T) in a Reproducing
+Kernel Hilbert Space (RKHS):
+  MMD^2(Z_S, Z_T) = E[k(z_s, z_s')] - 2*E[k(z_s, z_t)] + E[k(z_t, z_t')]
+
+Multi-Kernel Formulation:
+  k(x, x') = sum_{m=1}^5 exp( - ||x - x'||^2 / (2 * sigma_m^2) )
+  Bandwidths sigma_m are geometrically spaced around median pairwise distance:
+    sigma_m = sigma_base * (kernel_mul ^ (m - 2))
+
+Dynamic Lambda Adaptation Schedule:
+At early epochs, latent features are unformed; forcing strong domain alignment
+causes representation collapse. Following paper Eq. (12):
+  lambda_p = 2 / (1 + exp(-gamma * p)) - 1
+  where gamma = 10.0, and p = epoch / total_epochs in [0, 1].
+  - At epoch 1 (p ~ 0):  lambda_p ~ 0.0  (focus purely on source regression)
+  - At mid-training:     lambda_p smoothly ramps up
+  - At final epochs:     lambda_p -> 1.0  (full domain invariant alignment)
+
+
+7. TRAINING LOOP & OPTIMIZATION MECHANICS
+--------------------------------------------------------------------------------
+File: train_hybrido.py -> train_hybrido_session()
+
+7.1 Pure Adam Optimizer & Fixed Learning Rate
+  - Optimizer: Standard Adam (no weight decay, matching paper):
+      optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+  - Fixed learning rate: 0.0005 throughout training (no cosine decay default).
+
+7.2 Unified Combined Prediction Loss (Paper Equation 13)
+  The total objective function is:
+    L_total = MSE(Y_hat_S_comb, Y_S) + MSE(Y_hat_T_comb, Y_T) + lambda_p * MMD(Z_S, Z_T)
+  where:
+    Y_hat_S_comb = theta_S * G_Y^S(Z_S) + theta_T * G_Y^T(Z_S)
+    Y_hat_T_comb = theta_S * G_Y^S(Z_T) + theta_T * G_Y^T(Z_T)
+  Both source and target losses train the combined prediction, allowing the
+  trade-off parameters (theta_S, theta_T) to receive gradient signals from both
+  domains simultaneously.
+
+7.3 Validation-Driven Model Selection on Combined Output
+  - Validation occurs after every epoch on the held-out 10% Source cells.
+  - The model computes the combined prediction Y_hat_comb on validation cells.
+  - The checkpoint with the lowest Validation RMSE is saved and restored for
+    the final blind target test evaluation.
+
+7.4 Configured Schedule: 30 Epochs with Early Stopping Patience 8
+  - Total Epochs: 30
+  - Early Stopping: Halts training if Validation RMSE does not improve for 8
+    consecutive epochs, preventing overfitting while ensuring adequate training.
+
+
+8. EVALUATION METRICS FORMULATION
+--------------------------------------------------------------------------------
+The benchmark reports all metrics on the blind target test set (40% unseen cells):
+
+1. Root Mean Square Error (RMSE):
+     RMSE = sqrt( (1/N) * sum_{i=1}^N (y_i - y_hat_i)^2 )   [Cycles]
+
+2. Coefficient of Determination (R²):
+     R² = 1 - sum((y_i - y_hat_i)^2) / sum((y_i - y_mean)^2)
+
+3. Standard Per-Sample MAPE:
+     MAPE_std = (1/N) * sum_{i=1}^N ( |y_i - y_hat_i| / max(y_i, 1.0) ) * 100%
+
+4. Paper's Nominal-Cycle MAPE (Tran et al. Section 4.3):
+     MAPE_paper = (1/N) * sum_{i=1}^N ( |y_i - y_hat_i| / max(y_cycle_life) ) * 100%
+
+5. Floor MAPE (RUL >= 50 cycles):
+     Evaluates MAPE excluding near-EOL windows where division by tiny cycle counts
+     creates distortion.
+
+
+9. STEP-BY-STEP EXECUTION COMMANDS & TESTING INSTRUCTIONS
+--------------------------------------------------------------------------------
+
+Step 1: Verify Codebase Integrity (Run Automated Test Suite)
+  python src/hybridonet-adapt/test_hybrido.py
+  (Expected output: ALL 8/8 HARDENED TESTS PASSED SUCCESSFULLY)
+
+Step 2: Preprocess Datasets (Extract 18-D Rolling Features)
+  Source dataset (MATR / LFP):
+    python src/hybridonet-adapt/preprocess_hybrido.py \
+      --dataset matr \
+      --raw-dir data/hybridonet/raw/matr \
+      --output data/hybridonet/processed/MATR_raw_features.npz \
+      --window-size 10 \
+      --stride 30
+
+  Target dataset (HUST / NCM):
+    python src/hybridonet-adapt/preprocess_hybrido.py \
+      --dataset hust \
+      --raw-dir data/hybridonet/raw/hust \
+      --output data/hybridonet/processed/HUST_raw_features.npz \
+      --window-size 10 \
+      --stride 30
+
+Step 3: Run HybridoNet-Adapt Training & Benchmark
+  Single Run (30 epochs, patience 8, batchnorm, fixed lr 0.0005):
+    python src/hybridonet-adapt/train_hybrido.py \
+      --source data/hybridonet/processed/MATR_raw_features.npz \
+      --target data/hybridonet/processed/HUST_raw_features.npz \
+      --epochs 30 \
+      --early-stop-patience 8 \
+      --batch-size 128 \
+      --lr 0.0005 \
+      --norm-type batchnorm \
+      --checkpoint-path checkpoints/hybrido_best.pt
+
+  Full Paper Multi-Seed Benchmark (10 Repetitions with Ensemble Averaging):
+    python src/hybridonet-adapt/train_hybrido.py \
+      --source data/hybridonet/processed/MATR_raw_features.npz \
+      --target data/hybridonet/processed/HUST_raw_features.npz \
+      --epochs 30 \
+      --early-stop-patience 8 \
+      --num-runs 10 \
+      --batch-size 128 \
+      --lr 0.0005 \
+      --norm-type batchnorm \
+      --checkpoint-path checkpoints/hybrido_ensemble.pt
+
+Step 4: Visualize Results & Trajectories
+    python src/hybridonet-adapt/visualize_model.py \
+      --checkpoint checkpoints/hybrido_best.pt \
+      --source data/hybridonet/processed/MATR_raw_features.npz \
+      --target data/hybridonet/processed/HUST_raw_features.npz \
+      --norm-type batchnorm
+
+Step 5: Diagnostic Model Inspection
+    python src/hybridonet-adapt/investigate_model.py \
+      --checkpoint checkpoints/hybrido_best.pt \
+      --source data/hybridonet/processed/MATR_raw_features.npz \
+      --target data/hybridonet/processed/HUST_raw_features.npz \
+      --norm-type batchnorm
+================================================================================
