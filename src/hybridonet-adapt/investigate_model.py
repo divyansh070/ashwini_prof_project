@@ -326,7 +326,7 @@ def main():
     ap.add_argument("--rul-ceiling", type=float, default=2500.0)
     ap.add_argument("--severson-only", action="store_true")
     ap.add_argument("--hidden-dim", type=int, default=128)
-    ap.add_argument("--norm-type", default="layernorm")
+    ap.add_argument("--norm-type", default="batchnorm")
     args = ap.parse_args()
 
     os.makedirs(OUT, exist_ok=True)

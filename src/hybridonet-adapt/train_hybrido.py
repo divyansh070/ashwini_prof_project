@@ -196,18 +196,18 @@ def train_hybrido_session(
     source_loader: DataLoader,
     target_loader: DataLoader,
     val_loader: DataLoader,
-    target_test_loader: DataLoader,
-    target_y_test_raw: np.ndarray,
+    target_test_loader: DataLoader,    target_y_test_raw: np.ndarray,
     val_y_raw: np.ndarray,
     scaler_y: RobustRULScaler,
-    epochs: int = 60,
+    epochs: int = 30,
     lr: float = 0.0005,
     sigma_mmd: Optional[float] = None,
     mmd_kernel_num: int = 5,
     mmd_kernel_mul: float = 2.0,
-    mmd_weight: float = 0.1,
+    mmd_weight: float = 1.0,
     grad_clip_norm: float = 5.0,
-    early_stop_patience: Optional[int] = 15,
+    early_stop_patience: Optional[int] = 8,
+    use_scheduler: bool = False,
     checkpoint_path: Optional[str] = "checkpoints/hybrido_best.pt",
     device: str = "cpu"
 ) -> Dict[str, float]:
@@ -216,16 +216,16 @@ def train_hybrido_session(
     Paper-faithful training loop with validation-driven checkpoint selection and
     constrained trainable theta parameters.
 
-    ACCURACY IMPROVEMENTS vs. the original loop:
-    - MMDLoss uses a multi-kernel, adaptive bandwidth normalized by kernel_num.
-    - mmd_weight scales MMD to 10-20% of MSE loss magnitude to prevent representation mode collapse.
-    - A cosine-annealed LR schedule + gradient-norm clipping stabilize training over longer runs.
-    - Optional early stopping (on validation RMSE) lets you raise the epoch budget without
-      wasting compute once the model has converged.
+    TRAINING & LOSS SPECIFICATIONS (Tran et al., 2025):
+    - Adam optimizer with fixed learning rate (lr=0.0005, no weight decay).
+    - Source and target regression both use combined prediction Y_comb = theta_S * Y_S + theta_T * Y_T (Eq. 13).
+    - Validation-driven checkpoint selection uses combined prediction Y_comb on held-out cells.
+    - Multi-kernel MMD loss scaled dynamically by lambda_p = 2 / (1 + exp(-10*p)) - 1.
+    - Default 30 epochs with early stopping patience of 8.
     """
     model.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs)) if use_scheduler else None
     criterion_mse = nn.MSELoss()
     mmd_loss_fn = MMDLoss(kernel_num=mmd_kernel_num, kernel_mul=mmd_kernel_mul, fix_sigma=sigma_mmd)
 
@@ -257,18 +257,18 @@ def train_hybrido_session(
 
             optimizer.zero_grad()
 
-            # 1. Source forward pass -> predicts y_hat_s
-            _, y_pred_s, _, z_s = model(src_x)
-            loss_source = criterion_mse(y_pred_s, src_y)
+            # 1. Source forward pass -> combined prediction on source (matching paper Eq. 13)
+            y_comb_s, _, _, z_s = model(src_x)
+            loss_source = criterion_mse(y_comb_s, src_y)
 
-            # 2. Target forward pass -> predicts combined Y_hat_T = theta_s * y_s + theta_t * y_t
+            # 2. Target forward pass -> combined prediction on target
             y_comb_t, _, _, z_t = model(tgt_x)
             loss_target = criterion_mse(y_comb_t, tgt_y)
 
             # 3. Multi-Kernel Maximum Mean Discrepancy (MMD) Loss between feature representations
             loss_mmd = mmd_loss_fn(z_s, z_t)
 
-            # 4. Total Loss (balanced by mmd_weight to prevent MMD from overwhelming regression MSE)
+            # 4. Total Loss (Eq. 13: L_total = L_source + L_target + lambda_p * L_mmd)
             eff_lambda = mmd_weight * lambda_p
             loss_total = loss_source + loss_target + eff_lambda * loss_mmd
 
@@ -283,16 +283,17 @@ def train_hybrido_session(
             mmd_loss_accum += loss_mmd.item()
             batches += 1
 
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
-        # Validation Step (Model Selection occurs strictly on VALIDATION split)
+        # Validation Step (Model Selection occurs strictly on VALIDATION split using y_comb)
         model.eval()
         val_preds = []
         with torch.no_grad():
             for v_x, _ in val_loader:
                 v_x = v_x.to(device)
-                _, y_pred_s, _, _ = model(v_x)
-                val_preds.extend(y_pred_s.cpu().numpy().flatten())
+                y_comb_v, _, _, _ = model(v_x)
+                val_preds.extend(y_comb_v.cpu().numpy().flatten())
 
         val_preds = np.array(val_preds)
         val_pred_min = float(val_preds.min()) if len(val_preds) > 0 else 0.0
@@ -357,25 +358,30 @@ def train_hybrido_session(
     final_test_rmse = float(np.sqrt(mean_squared_error(target_y_test_raw, test_preds_unscaled)))
     final_test_r2 = float(r2_score(target_y_test_raw, test_preds_unscaled))
 
-    # 1. Paper's MAPE: Section 4.3 (Page 13) defines MAPE divided by the cell's nominal cycle life y:
+    # 1. Standard per-sample MAPE: (1/N) * sum(|y_i - y_hat_i| / max(y_i, 1.0)) * 100%
+    safe_target = np.maximum(target_y_test_raw, 1.0)
+    final_test_standard_mape = float(np.mean(np.abs(target_y_test_raw - test_preds_unscaled) / safe_target) * 100.0)
+
+    # 2. Paper's nominal-cycle-life MAPE: Section 4.3 defines MAPE divided by the cell's nominal cycle life y:
     # MAPE = (1/N) * sum(|y_i - y_hat_i| / y_cycle_life) * 100%
     target_nominal_life = float(np.max(target_y_test_raw))
     final_test_paper_mape = float(np.mean(np.abs(target_y_test_raw - test_preds_unscaled) / max(target_nominal_life, 1.0)) * 100.0)
 
-    # 2. Floor MAPE: Evaluates instantaneous MAPE excluding near-EOL windows (<50 cycles) where division by near-zero blows up
+    # 3. Floor MAPE: Evaluates instantaneous MAPE excluding near-EOL windows (<50 cycles) where division by near-zero blows up
     mask_floor = target_y_test_raw >= 50.0
     if np.any(mask_floor):
         final_test_floor_mape = float(mean_absolute_percentage_error(target_y_test_raw[mask_floor], test_preds_unscaled[mask_floor]) * 100.0)
     else:
         final_test_floor_mape = float("nan")
 
-    # 3. Raw scikit-learn instantaneous MAPE (unbounded near EOL)
+    # 4. Raw scikit-learn instantaneous MAPE (unbounded near EOL)
     final_test_raw_mape = float(mean_absolute_percentage_error(target_y_test_raw, test_preds_unscaled) * 100.0)
 
     logger.info(
         f"\n[FINAL TEST EVALUATION] Chosen Epoch: {best_epoch} | "
         f"Test RMSE: {final_test_rmse:.2f} cycles | "
         f"Test R²: {final_test_r2:.4f} | "
+        f"Standard MAPE: {final_test_standard_mape:.2f}% | "
         f"Paper MAPE: {final_test_paper_mape:.2f}% | "
         f"Floor MAPE (RUL>=50): {final_test_floor_mape:.2f}% | "
         f"Raw MAPE: {final_test_raw_mape:.2f}%"
@@ -386,10 +392,11 @@ def train_hybrido_session(
         "best_val_rmse": best_val_rmse,
         "test_rmse": final_test_rmse,
         "test_r2": final_test_r2,
+        "test_standard_mape": final_test_standard_mape,
         "test_paper_mape": final_test_paper_mape,
         "test_floor_mape": final_test_floor_mape,
         "test_raw_mape": final_test_raw_mape,
-        "test_mape": final_test_paper_mape,
+        "test_mape": final_test_standard_mape,
         "final_theta_s": float(model.theta_s.item()),
         "final_theta_t": float(model.theta_t.item()),
         "test_preds_unscaled": test_preds_unscaled
@@ -415,18 +422,19 @@ def filter_severson_cells(
 def run_benchmark(
     source_npz: str,
     target_npz: str,
-    epochs: int = 60,
+    epochs: int = 30,
     batch_size: int = 128,
     lr: float = 0.0005,
     val_ratio: float = 0.10,
     sigma_mmd: Optional[float] = None,
     mmd_kernel_num: int = 5,
     mmd_kernel_mul: float = 2.0,
-    early_stop_patience: Optional[int] = 15,
+    early_stop_patience: Optional[int] = 8,
     rul_ceiling: float = DEFAULT_RUL_MAX_CEILING,
-    norm_type: str = "layernorm",
+    norm_type: str = "batchnorm",
     severson_only: bool = False,
-    mmd_weight: float = 0.1,
+    mmd_weight: float = 1.0,
+    use_scheduler: bool = False,
     checkpoint_path: str = "checkpoints/hybrido_best.pt",
     seed: int = 42,
     num_runs: int = 1,
@@ -533,6 +541,7 @@ def run_benchmark(
             mmd_kernel_mul=mmd_kernel_mul,
             mmd_weight=mmd_weight,
             early_stop_patience=early_stop_patience,
+            use_scheduler=use_scheduler,
             checkpoint_path=checkpoint_path,
             device=device
         )
@@ -540,6 +549,7 @@ def run_benchmark(
         logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
         logger.info(f"Target Test RMSE:        {results['test_rmse']:.2f} cycles")
         logger.info(f"Target Test R²:          {results['test_r2']:.4f}")
+        logger.info(f"Standard MAPE (sample):  {results['test_standard_mape']:.2f}%")
         logger.info(f"Paper MAPE (vs EOL):     {results['test_paper_mape']:.2f}%")
         logger.info(f"Floor MAPE (RUL >= 50):  {results['test_floor_mape']:.2f}%")
         logger.info(f"Raw MAPE (unbounded):    {results['test_raw_mape']:.2f}%")
@@ -585,6 +595,7 @@ def run_benchmark(
                 mmd_kernel_mul=mmd_kernel_mul,
                 mmd_weight=mmd_weight,
                 early_stop_patience=early_stop_patience,
+                use_scheduler=use_scheduler,
                 checkpoint_path=run_ckpt,
                 device=device
             )
@@ -594,6 +605,7 @@ def run_benchmark(
 
         rmses = np.array([r["test_rmse"] for r in all_results])
         r2s = np.array([r["test_r2"] for r in all_results])
+        std_mapes = np.array([r["test_standard_mape"] for r in all_results])
         paper_mapes = np.array([r["test_paper_mape"] for r in all_results])
         floor_mapes = np.array([r["test_floor_mape"] for r in all_results])
 
@@ -601,6 +613,8 @@ def run_benchmark(
         ens_preds = np.mean(all_test_preds, axis=0)
         ens_rmse = float(np.sqrt(mean_squared_error(Y_tgt_test, ens_preds)))
         ens_r2 = float(r2_score(Y_tgt_test, ens_preds))
+        safe_target = np.maximum(Y_tgt_test, 1.0)
+        ens_std_mape = float(np.mean(np.abs(Y_tgt_test - ens_preds) / safe_target) * 100.0)
         target_nominal_life = float(np.max(Y_tgt_test))
         ens_paper_mape = float(np.mean(np.abs(Y_tgt_test - ens_preds) / max(target_nominal_life, 1.0)) * 100.0)
         mask_floor = Y_tgt_test >= 50.0
@@ -612,12 +626,14 @@ def run_benchmark(
         logger.info(f"Individual Runs (Mean ± Std):")
         logger.info(f"  Test RMSE:          {np.mean(rmses):.2f} ± {np.std(rmses):.2f} cycles")
         logger.info(f"  Test R²:            {np.mean(r2s):.4f} ± {np.std(r2s):.4f}")
+        logger.info(f"  Standard MAPE:      {np.mean(std_mapes):.2f}% ± {np.std(std_mapes):.2f}%")
         logger.info(f"  Paper MAPE:         {np.mean(paper_mapes):.2f}% ± {np.std(paper_mapes):.2f}%")
         logger.info(f"  Floor MAPE (>=50):  {np.mean(floor_mapes):.2f}% ± {np.std(floor_mapes):.2f}%")
         logger.info("-" * 60)
         logger.info(f"Ensemble-Averaged Prediction (Published Paper Methodology):")
         logger.info(f"  Ensemble Test RMSE:         {ens_rmse:.2f} cycles")
         logger.info(f"  Ensemble Test R²:           {ens_r2:.4f}")
+        logger.info(f"  Ensemble Standard MAPE:     {ens_std_mape:.2f}%")
         logger.info(f"  Ensemble Paper MAPE:        {ens_paper_mape:.2f}%")
         logger.info(f"  Ensemble Floor MAPE (>=50): {ens_floor_mape:.2f}%")
         logger.info("=" * 60)
@@ -627,9 +643,11 @@ def run_benchmark(
             "std_rmse": float(np.std(rmses)),
             "mean_r2": float(np.mean(r2s)),
             "std_r2": float(np.std(r2s)),
+            "mean_standard_mape": float(np.mean(std_mapes)),
             "mean_paper_mape": float(np.mean(paper_mapes)),
             "ensemble_rmse": ens_rmse,
             "ensemble_r2": ens_r2,
+            "ensemble_standard_mape": ens_std_mape,
             "ensemble_paper_mape": ens_paper_mape
         }
 
@@ -662,20 +680,21 @@ def main():
     parser = argparse.ArgumentParser(description="HybridoNet-Adapt Benchmark Runner")
     parser.add_argument("--source", type=str, required=True, help="Path to source .npz raw features (REQUIRED)")
     parser.add_argument("--target", type=str, required=True, help="Path to target .npz raw features (REQUIRED)")
-    parser.add_argument("--epochs", type=int, default=60, help="Number of training epochs (default=60; paired with early stopping)")
+    parser.add_argument("--epochs", type=int, default=30, help="Number of training epochs (default=30; paired with early stopping)")
     parser.add_argument("--batch-size", type=int, default=128, help="Batch size (paper default=128)")
-    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005), cosine-annealed over training")
+    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate (paper default=0.0005, fixed lr)")
     parser.add_argument("--val-ratio", type=float, default=0.10, help="Source cell validation ratio (default 0.10)")
     parser.add_argument("--sigma-mmd", type=float, default=None, help="Fixed MMD bandwidth. If omitted (default), the bandwidth is estimated adaptively per batch, which is more robust than a hardcoded value.")
     parser.add_argument("--mmd-kernel-num", type=int, default=5, help="Number of Gaussian kernels to sum for multi-kernel MMD (default=5)")
     parser.add_argument("--mmd-kernel-mul", type=float, default=2.0, help="Geometric spacing factor between MMD kernel bandwidths (default=2.0)")
-    parser.add_argument("--mmd-weight", type=float, default=0.1, help="Static multiplier on MMD loss (default: 0.1; prevents MMD from overpowering regression MSE and triggering mode collapse)")
-    parser.add_argument("--early-stop-patience", type=int, default=15, help="Stop if Val RMSE hasn't improved for this many epochs. Set to 0 to disable.")
+    parser.add_argument("--mmd-weight", type=float, default=1.0, help="Static multiplier on MMD loss (default: 1.0, matching paper Eq. 13)")
+    parser.add_argument("--early-stop-patience", type=int, default=8, help="Stop if Val RMSE hasn't improved for this many epochs (default: 8; set to 0 to disable).")
     parser.add_argument("--rul-ceiling", type=float, default=DEFAULT_RUL_MAX_CEILING, help="Fixed physical RUL ceiling in cycles used for normalization (default=2500).")
-    parser.add_argument("--norm-type", type=str, choices=["layernorm", "batchnorm"], default="layernorm", help="Normalization layer in predictor heads (default: layernorm, prevents cross-domain running statistics contamination; use batchnorm for paper Table 2 reproduction)")
+    parser.add_argument("--norm-type", type=str, choices=["layernorm", "batchnorm"], default="batchnorm", help="Normalization layer in predictor heads (default: batchnorm matching paper Table 2; layernorm also supported)")
     parser.add_argument("--severson-only", action="store_true", help="Filter MATR dataset to the 124 cells from Severson et al. 2019 (batches 1-3), excluding Attia batch 4")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for model initialization and data splitting (default: 42)")
     parser.add_argument("--num-runs", type=int, default=1, help="Number of repetitions to run (default: 1; paper Section 4.1 uses 10 runs with ensemble averaging)")
+    parser.add_argument("--use-scheduler", action="store_true", help="Enable cosine annealing learning rate scheduler (default: False, paper uses fixed lr)")
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints/hybrido_best.pt", help="Path to save the best model checkpoint (default: checkpoints/hybrido_best.pt)")
     args = parser.parse_args()
 
@@ -707,6 +726,7 @@ def main():
         norm_type=args.norm_type,
         severson_only=args.severson_only,
         mmd_weight=args.mmd_weight,
+        use_scheduler=args.use_scheduler,
         checkpoint_path=args.checkpoint_path,
         seed=args.seed,
         num_runs=args.num_runs,
