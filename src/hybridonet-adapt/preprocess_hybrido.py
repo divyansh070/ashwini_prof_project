@@ -79,7 +79,8 @@ def compute_cycle_statistics(
 def extract_window_tensor(
     cycle_data: Dict[int, Dict[str, np.ndarray]],
     window_cycles: List[int],
-    num_samples: int = 10
+    num_samples: int = 10,
+    cycle_stats_cache: Optional[Dict[int, np.ndarray]] = None
 ) -> Optional[np.ndarray]:
     """
     Uniformly samples `num_samples` (10) cycles from a list of window cycles (e.g. 30 cycles).
@@ -96,11 +97,16 @@ def extract_window_tensor(
 
     cell_tensor = np.zeros((num_samples, 3, 6), dtype=np.float32)
     for step_idx, cyc in enumerate(selected_cycles):
-        c_dict = cycle_data[cyc]
-        v = np.array(c_dict.get("voltage", c_dict.get("V", [])))
-        i = np.array(c_dict.get("current", c_dict.get("I", [])))
-        q = np.array(c_dict.get("capacity", c_dict.get("Q", c_dict.get("Qd", []))))
-        feat_3x6 = compute_cycle_statistics(v, i, q)
+        if cycle_stats_cache is not None and cyc in cycle_stats_cache:
+            feat_3x6 = cycle_stats_cache[cyc]
+        else:
+            c_dict = cycle_data[cyc]
+            v = np.array(c_dict.get("voltage", c_dict.get("V", [])))
+            i = np.array(c_dict.get("current", c_dict.get("I", [])))
+            q = np.array(c_dict.get("capacity", c_dict.get("Q", c_dict.get("Qd", []))))
+            feat_3x6 = compute_cycle_statistics(v, i, q)
+            if cycle_stats_cache is not None:
+                cycle_stats_cache[cyc] = feat_3x6
         cell_tensor[step_idx] = feat_3x6
 
     return cell_tensor
@@ -126,12 +132,13 @@ def extract_cell_samples(
 
     samples = []
     ruls = []
+    cycle_stats_cache = {}
 
     if not rolling:
         # Single early-life window [1..30]
         window = [c for c in available_cycles if c <= window_size]
         if len(window) >= num_samples:
-            tensor = extract_window_tensor(cycle_data, window, num_samples)
+            tensor = extract_window_tensor(cycle_data, window, num_samples, cycle_stats_cache=cycle_stats_cache)
             if tensor is not None and not np.isnan(tensor).any():
                 samples.append(tensor)
                 ruls.append(max(0.0, float(eol - window[-1])))
@@ -146,7 +153,7 @@ def extract_cell_samples(
         if current_cycle >= eol:
             break
 
-        tensor = extract_window_tensor(cycle_data, window, num_samples)
+        tensor = extract_window_tensor(cycle_data, window, num_samples, cycle_stats_cache=cycle_stats_cache)
         if tensor is not None and not np.isnan(tensor).any():
             true_rul = float(eol - current_cycle)
             samples.append(tensor)
