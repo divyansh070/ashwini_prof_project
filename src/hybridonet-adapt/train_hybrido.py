@@ -11,7 +11,7 @@ Implements:
    MSE(theta_s * Y_hat_s + theta_t * Y_hat_t, Y_target).
 6. Dynamic Lambda Scheduling: lambda_p = 2 / (1 + exp(-10 * p)) - 1
 7. Scientific Validation: Model selection is driven strictly by validation loss. Blind test set is evaluated ONLY ONCE at the end.
-8. 18-D Feature Scaling: Fitted across samples and time steps strictly on the source training split.
+8. 18-D Feature Scaling: Fitted on source-train + target-adaptation splits (blind test split excluded), clipped to [-0.5, 1.5].
 
 ACCURACY IMPROVEMENTS over the original version:
 - Multi-kernel, adaptive-bandwidth MMD loss (see mmd_loss.py) instead of a single fixed-sigma kernel.
@@ -196,7 +196,8 @@ def train_hybrido_session(
     source_loader: DataLoader,
     target_loader: DataLoader,
     val_loader: DataLoader,
-    target_test_loader: DataLoader,    target_y_test_raw: np.ndarray,
+    target_test_loader: DataLoader,
+    target_y_test_raw: np.ndarray,
     val_y_raw: np.ndarray,
     scaler_y: RobustRULScaler,
     epochs: int = 30,
@@ -207,7 +208,9 @@ def train_hybrido_session(
     mmd_weight: float = 1.0,
     grad_clip_norm: float = 5.0,
     early_stop_patience: Optional[int] = 8,
-    use_scheduler: bool = False,
+    use_scheduler: bool = True,
+    lr_min: float = 1e-4,
+    weight_decay: float = 1e-4,
     checkpoint_path: Optional[str] = "checkpoints/hybrido_best.pt",
     device: str = "cpu"
 ) -> Dict[str, float]:
@@ -217,15 +220,23 @@ def train_hybrido_session(
     constrained trainable theta parameters.
 
     TRAINING & LOSS SPECIFICATIONS (Tran et al., 2025):
-    - Adam optimizer with fixed learning rate (lr=0.0005, no weight decay).
-    - Source and target regression both use combined prediction Y_comb = theta_S * Y_S + theta_T * Y_T (Eq. 13).
+    - AdamW optimizer (paper Sec. 4.1), weight decay 1e-4; cosine LR 5e-4 -> 1e-4 floor (never 0).
+    - Source and target regression both use combined prediction Y_comb = theta_S * Y_S + theta_T * Y_T.
+      NOTE: paper Eq. 2 defines the source prediction as the source head alone; using Y_comb
+      on source is a deliberate design choice here, not a paper-exact reproduction.
     - Validation-driven checkpoint selection uses combined prediction Y_comb on held-out cells.
     - Multi-kernel MMD loss scaled dynamically by lambda_p = 2 / (1 + exp(-10*p)) - 1.
     - Default 30 epochs with early stopping patience of 8.
     """
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs)) if use_scheduler else None
+    # AdamW (paper Sec. 4.1: "optimized using the AdamW algorithm") with decoupled weight decay.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # Cosine annealing with a floor: LR decays lr -> lr_min (5e-4 -> 1e-4) and never reaches 0,
+    # so theta and the target head keep learning in late epochs.
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs), eta_min=lr_min)
+        if use_scheduler else None
+    )
     criterion_mse = nn.MSELoss()
     mmd_loss_fn = MMDLoss(kernel_num=mmd_kernel_num, kernel_mul=mmd_kernel_mul, fix_sigma=sigma_mmd)
 
@@ -381,8 +392,8 @@ def train_hybrido_session(
         f"\n[FINAL TEST EVALUATION] Chosen Epoch: {best_epoch} | "
         f"Test RMSE: {final_test_rmse:.2f} cycles | "
         f"Test R²: {final_test_r2:.4f} | "
-        f"Standard MAPE: {final_test_standard_mape:.2f}% | "
-        f"Paper MAPE: {final_test_paper_mape:.2f}% | "
+        f"MAPE (paper def.): {final_test_paper_mape:.2f}% | "
+        f"Per-sample MAPE: {final_test_standard_mape:.2f}% | "
         f"Floor MAPE (RUL>=50): {final_test_floor_mape:.2f}% | "
         f"Raw MAPE: {final_test_raw_mape:.2f}%"
     )
@@ -396,7 +407,7 @@ def train_hybrido_session(
         "test_paper_mape": final_test_paper_mape,
         "test_floor_mape": final_test_floor_mape,
         "test_raw_mape": final_test_raw_mape,
-        "test_mape": final_test_standard_mape,
+        "test_mape": final_test_paper_mape,  # primary MAPE = paper Sec. 4.3 definition
         "final_theta_s": float(model.theta_s.item()),
         "final_theta_t": float(model.theta_t.item()),
         "test_preds_unscaled": test_preds_unscaled
@@ -434,10 +445,12 @@ def run_benchmark(
     norm_type: str = "batchnorm",
     severson_only: bool = False,
     mmd_weight: float = 1.0,
-    use_scheduler: bool = False,
+    use_scheduler: bool = True,
+    lr_min: float = 1e-4,
+    weight_decay: float = 1e-4,
     checkpoint_path: str = "checkpoints/hybrido_best.pt",
     seed: int = 42,
-    num_runs: int = 1,
+    num_runs: int = 10,
     device: str = "cpu"
 ):
     """
@@ -542,6 +555,8 @@ def run_benchmark(
             mmd_weight=mmd_weight,
             early_stop_patience=early_stop_patience,
             use_scheduler=use_scheduler,
+            lr_min=lr_min,
+            weight_decay=weight_decay,
             checkpoint_path=checkpoint_path,
             device=device
         )
@@ -549,8 +564,8 @@ def run_benchmark(
         logger.info("HYBRIDONET-ADAPT BENCHMARK RESULTS")
         logger.info(f"Target Test RMSE:        {results['test_rmse']:.2f} cycles")
         logger.info(f"Target Test R²:          {results['test_r2']:.4f}")
-        logger.info(f"Standard MAPE (sample):  {results['test_standard_mape']:.2f}%")
-        logger.info(f"Paper MAPE (vs EOL):     {results['test_paper_mape']:.2f}%")
+        logger.info(f"MAPE (paper def.):       {results['test_paper_mape']:.2f}%")
+        logger.info(f"Per-sample MAPE:         {results['test_standard_mape']:.2f}%")
         logger.info(f"Floor MAPE (RUL >= 50):  {results['test_floor_mape']:.2f}%")
         logger.info(f"Raw MAPE (unbounded):    {results['test_raw_mape']:.2f}%")
         logger.info(f"Trained Trade-off Weights: theta_S={results['final_theta_s']:.4f}, theta_T={results['final_theta_t']:.4f}")
@@ -596,6 +611,8 @@ def run_benchmark(
                 mmd_weight=mmd_weight,
                 early_stop_patience=early_stop_patience,
                 use_scheduler=use_scheduler,
+                lr_min=lr_min,
+                weight_decay=weight_decay,
                 checkpoint_path=run_ckpt,
                 device=device
             )
@@ -626,15 +643,15 @@ def run_benchmark(
         logger.info(f"Individual Runs (Mean ± Std):")
         logger.info(f"  Test RMSE:          {np.mean(rmses):.2f} ± {np.std(rmses):.2f} cycles")
         logger.info(f"  Test R²:            {np.mean(r2s):.4f} ± {np.std(r2s):.4f}")
-        logger.info(f"  Standard MAPE:      {np.mean(std_mapes):.2f}% ± {np.std(std_mapes):.2f}%")
-        logger.info(f"  Paper MAPE:         {np.mean(paper_mapes):.2f}% ± {np.std(paper_mapes):.2f}%")
+        logger.info(f"  MAPE (paper def.):  {np.mean(paper_mapes):.2f}% ± {np.std(paper_mapes):.2f}%")
+        logger.info(f"  Per-sample MAPE:    {np.mean(std_mapes):.2f}% ± {np.std(std_mapes):.2f}%")
         logger.info(f"  Floor MAPE (>=50):  {np.mean(floor_mapes):.2f}% ± {np.std(floor_mapes):.2f}%")
         logger.info("-" * 60)
         logger.info(f"Ensemble-Averaged Prediction (Published Paper Methodology):")
         logger.info(f"  Ensemble Test RMSE:         {ens_rmse:.2f} cycles")
         logger.info(f"  Ensemble Test R²:           {ens_r2:.4f}")
-        logger.info(f"  Ensemble Standard MAPE:     {ens_std_mape:.2f}%")
-        logger.info(f"  Ensemble Paper MAPE:        {ens_paper_mape:.2f}%")
+        logger.info(f"  Ensemble MAPE (paper def.): {ens_paper_mape:.2f}%")
+        logger.info(f"  Ensemble Per-sample MAPE:   {ens_std_mape:.2f}%")
         logger.info(f"  Ensemble Floor MAPE (>=50): {ens_floor_mape:.2f}%")
         logger.info("=" * 60)
 
@@ -645,6 +662,8 @@ def run_benchmark(
             "std_r2": float(np.std(r2s)),
             "mean_standard_mape": float(np.mean(std_mapes)),
             "mean_paper_mape": float(np.mean(paper_mapes)),
+            "std_paper_mape": float(np.std(paper_mapes)),
+            "mean_mape": float(np.mean(paper_mapes)),
             "ensemble_rmse": ens_rmse,
             "ensemble_r2": ens_r2,
             "ensemble_standard_mape": ens_std_mape,
@@ -693,8 +712,10 @@ def main():
     parser.add_argument("--norm-type", type=str, choices=["layernorm", "batchnorm"], default="batchnorm", help="Normalization layer in predictor heads (default: batchnorm matching paper Table 2; layernorm also supported)")
     parser.add_argument("--severson-only", action="store_true", help="Filter MATR dataset to the 124 cells from Severson et al. 2019 (batches 1-3), excluding Attia batch 4")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for model initialization and data splitting (default: 42)")
-    parser.add_argument("--num-runs", type=int, default=1, help="Number of repetitions to run (default: 1; paper Section 4.1 uses 10 runs with ensemble averaging)")
-    parser.add_argument("--use-scheduler", action="store_true", help="Enable cosine annealing learning rate scheduler (default: False, paper uses fixed lr)")
+    parser.add_argument("--num-runs", type=int, default=10, help="Number of repetitions (default: 10, matching paper Sec. 4.1 ensemble averaging)")
+    parser.add_argument("--no-scheduler", action="store_true", help="Disable cosine LR schedule (default: ON, decays --lr -> --lr-min)")
+    parser.add_argument("--lr-min", type=float, default=1e-4, help="Cosine schedule floor; LR never goes below this (default: 1e-4)")
+    parser.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW decoupled weight decay (default: 1e-4)")
     parser.add_argument("--checkpoint-path", type=str, default="checkpoints/hybrido_best.pt", help="Path to save the best model checkpoint (default: checkpoints/hybrido_best.pt)")
     args = parser.parse_args()
 
@@ -726,7 +747,9 @@ def main():
         norm_type=args.norm_type,
         severson_only=args.severson_only,
         mmd_weight=args.mmd_weight,
-        use_scheduler=args.use_scheduler,
+        use_scheduler=not args.no_scheduler,
+        lr_min=args.lr_min,
+        weight_decay=args.weight_decay,
         checkpoint_path=args.checkpoint_path,
         seed=args.seed,
         num_runs=args.num_runs,
