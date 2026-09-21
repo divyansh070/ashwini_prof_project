@@ -43,15 +43,45 @@ python3 src/hybridonet-adapt/train_paper.py \
     --num-runs 1
 ```
 
-### Step 4: Full Paper Replication Run (10 Runs x 10 Epochs)
+### Step 4: Quick Check for Under-Training (~2-3 minutes)
+The model was previously undertrained because stride 10 yields only 20 gradient steps per epoch (200 steps total).
+Train for 100 epochs to give ~2,000 gradient steps and verify if RMSE drops toward 153 cycles:
 ```bash
+# 1-run quick check:
 python3 src/hybridonet-adapt/train_paper.py \
     --source data/hybridonet/processed/MATR_raw_features.npz \
     --target data/hybridonet/processed/HUST_raw_features.npz \
+    --epochs 100 \
+    --num-runs 1 \
+    --log-interval 10
+
+# Full 10-run ensemble with 100 epochs:
+python3 src/hybridonet-adapt/train_paper.py \
+    --source data/hybridonet/processed/MATR_raw_features.npz \
+    --target data/hybridonet/processed/HUST_raw_features.npz \
+    --epochs 100 \
+    --num-runs 10 \
+    --log-interval 10 \
+    --checkpoint-dir checkpoints/paper_ep100 \
+    --results-json results/paper_replication_ep100.json
+```
+
+### Step 5: Paper-Faithful Dense Windows (Stride 1)
+The paper plots dense predictions along cell life (Fig. 9), indicating **stride 1** (~26,800 source windows, giving ~2,090 gradient steps under the paper's original 10 epochs):
+```bash
+# 1. Preprocess with stride 1 into a separate folder:
+python3 src/hybridonet-adapt/preprocess_hybrido.py \
+    --stride 1 \
+    --output-dir data/hybridonet/processed_stride1
+
+# 2. Train with default 10 epochs on stride 1 data:
+python3 src/hybridonet-adapt/train_paper.py \
+    --source data/hybridonet/processed_stride1/MATR_raw_features.npz \
+    --target data/hybridonet/processed_stride1/HUST_raw_features.npz \
     --epochs 10 \
     --num-runs 10 \
-    --checkpoint-dir checkpoints/paper \
-    --results-json results/paper_replication.json
+    --checkpoint-dir checkpoints/paper_stride1 \
+    --results-json results/paper_replication_stride1.json
 ```
 
 All defaults match the paper:

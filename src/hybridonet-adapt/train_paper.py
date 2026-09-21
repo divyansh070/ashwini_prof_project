@@ -327,12 +327,26 @@ def train_one(args, seed: int, data: Dict, device: str, input_dim: int) -> Tuple
     dl_t = DataLoader(ds_t, batch_size=bs_t, shuffle=True, drop_last=drop_t, generator=g)
 
     best = (float("inf"), None, 0)
+    it_s = iter(dl_s)
+    it_t = iter(dl_t)
+    steps_mode = getattr(args, "steps_per_epoch", "source")
+    if steps_mode == "max":
+        steps_per_ep = max(len(dl_s), len(dl_t))
+    elif steps_mode == "target":
+        steps_per_ep = len(dl_t)
+    else:
+        steps_per_ep = len(dl_s)
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         lam = dynamic_lambda(epoch, args.epochs)
-        it_t = iter(dl_t)
         tot = {"src": 0.0, "tgt": 0.0, "mmd": 0.0, "n": 0}
-        for xs, ys in dl_s:
+        for _ in range(steps_per_ep):
+            try:
+                xs, ys = next(it_s)
+            except StopIteration:
+                it_s = iter(dl_s)
+                xs, ys = next(it_s)
             try:
                 xt, yt = next(it_t)
             except StopIteration:
@@ -357,11 +371,15 @@ def train_one(args, seed: int, data: Dict, device: str, input_dim: int) -> Tuple
         vp = predict(model, data["Xv"], device, use=data["val_use"]) * data["y_max"]
         v_rmse = float(np.sqrt(((vp - data["yv_raw"]) ** 2).mean()))
         n = max(1, tot["n"])
-        log.info(f"  seed {seed} ep {epoch:02d}/{args.epochs} | src {tot['src']/n:.4f} "
-                 f"tgt {tot['tgt']/n:.4f} mmd {tot['mmd']/n:.4f} (lam {lam:.3f}) | "
-                 f"val RMSE {v_rmse:7.2f} | val pred [{vp.min():.0f}, {vp.max():.0f}] | "
-                 f"theta_S {model.theta_s.item():.3f} theta_T {model.theta_t.item():.3f}")
-        if v_rmse < best[0]:
+        is_best = v_rmse < best[0]
+        log_every = getattr(args, "log_interval", 1)
+        if is_best or epoch == 1 or epoch == args.epochs or (epoch % log_every == 0):
+            best_mark = " *" if is_best else ""
+            log.info(f"  seed {seed} ep {epoch:02d}/{args.epochs} | src {tot['src']/n:.4f} "
+                     f"tgt {tot['tgt']/n:.4f} mmd {tot['mmd']/n:.4f} (lam {lam:.3f}) | "
+                     f"val RMSE {v_rmse:7.2f}{best_mark} | val pred [{vp.min():.0f}, {vp.max():.0f}] | "
+                     f"theta_S {model.theta_s.item():.3f} theta_T {model.theta_t.item():.3f}")
+        if is_best:
             best = (v_rmse, copy.deepcopy(model.state_dict()), epoch)
 
     if best[1] is not None:
@@ -402,6 +420,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="first seed; runs use seed..seed+N-1")
     ap.add_argument("--window-size", type=int, default=30,
                     help="window length used in preprocessing (cycle life = max RUL + this)")
+    ap.add_argument("--steps-per-epoch", default="source", choices=["source", "max", "target"],
+                    help="how many gradient steps make an epoch (default: 'source' = len(source)/batch_size; "
+                         "'max' = max(len(source), len(target))/batch_size)")
+    ap.add_argument("--log-interval", type=int, default=1,
+                    help="log every N epochs (always logs epoch 1, best checkpoints, and final epoch)")
     # --- architecture (paper) ---
     ap.add_argument("--hidden-dim", type=int, default=64, help="paper: 64")
     ap.add_argument("--lstm-layers", type=int, default=2, help="paper: 2")
