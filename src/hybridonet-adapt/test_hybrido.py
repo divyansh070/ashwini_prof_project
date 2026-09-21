@@ -224,6 +224,7 @@ def test_18d_feature_scaling():
 
 def test_end_to_end_smoke():
     print("[TEST 8/8] Testing Full End-to-End Pipeline Smoke Run...")
+    np.random.seed(42)
     # Generate 4 source cells, 4 target cells (3 windows each)
     src_cells = np.repeat([f"src_c{i}" for i in range(4)], 3)
     tgt_cells = np.repeat([f"tgt_c{i}" for i in range(4)], 3)
