@@ -1,346 +1,392 @@
 ================================================================================
-           HYBRIDONET-ADAPT: CROSS-CHEMISTRY BATTERY RUL PREDICTION
-         COMPLETE PIPELINE EXPLANATION & ARCHITECTURAL REFERENCE
+          HYBRIDONET-ADAPT: CROSS-DOMAIN BATTERY RUL PREDICTION
+     PIPELINE EXPLANATION, CHANGE LOG & RUN GUIDE  (REVISED VERSION)
 ================================================================================
 
 Paper Reference:
-  Tran et al. (2025), "HybridoNet-Adapt: A Hybrid Neural Network with Domain
-  Adaptation for Battery Remaining Useful Life Prediction", PLOS ONE.
-  DOI: 10.1371/journal.pone.0335066
+  Tran et al. (2025), "HybridoNet-Adapt: A domain-adapted framework for accurate
+  lithium-ion battery RUL prediction", PLOS ONE 20(10): e0335066.
+  DOI: 10.1371/journal.pone.0335066   (preprint: arXiv 2503.21392)
 
-Target Cross-Domain Benchmark (Published Paper Table 2 & Section 4):
-  - RMSE: ~166.33 cycles (Best overall ~153.24 cycles)
-  - Coefficient of Determination (R²): ~0.86 (Best overall ~0.88)
-  - Mean Absolute Percentage Error (MAPE): ~7.44%
+Paper results (Table 3, row "All", second dataset):
+  HybridoNet       (no domain adaptation): RMSE 166.33 | R2 0.86 | MAPE 7.44 %
+  HybridoNet-Adapt (with MMD adaptation) : RMSE 153.24 | R2 0.88 | MAPE 7.30 %
+  (Section 4.6 quotes 166.33 / 0.86 / 7.44 % for the feature-extractor ablation.)
 
 
-TABLE OF CONTENTS
+CONTENTS
 --------------------------------------------------------------------------------
-1. Problem Formulation & Cross-Chemistry Adaptation Intuition
-2. Data Preprocessing & 18-D Feature Extraction Pipeline
-3. Disjoint Cell-Level Partitioning (Zero-Leakage Guarantee)
-4. Feature & RUL Normalization (Anti-Saturation Scaling)
-5. Deep Hybrid Neural Architecture (Stage-by-Stage Breakdown)
-   5.1 Two-Layer LSTM Temporal Feature Encoder
-   5.2 Multihead Scaled Dot-Product Self-Attention
-   5.3 Deterministic Attention Step Selection (h_{t=-1})
-   5.4 Neural Ordinary Differential Equation (NODE) Block (RK4 Solver)
-   5.5 Post-NODE Normalization
-   5.6 Dual Predictor Heads (Source Head G_Y^S & Target Head G_Y^T)
-   5.7 Softmax-Constrained Convex Trade-Off Formulation (theta_S, theta_T)
-6. Domain Adaptation via Multi-Kernel MMD & Dynamic Scheduling
-7. Training Loop & Optimization Mechanics
-   7.1 Pure Adam Optimizer & Fixed Learning Rate
-   7.2 Unified Combined Prediction Loss (Equation 13)
-   7.3 Validation-Driven Model Selection on Combined Output
-   7.4 Configured Schedule: 30 Epochs with Early Stopping Patience 8
-8. Evaluation Metrics Formulation
-9. Step-by-Step Execution Commands & Testing Instructions
+0. Change log: what was done in this revision (status of the 9 planned items)
+1. Problem formulation
+2. Data preprocessing & 18-D feature extraction
+3. Cell-level partitioning (zero-leakage guarantee)
+4. Feature & RUL normalization
+5. Neural architecture (LSTM -> attention -> NODE -> dual predictors)
+6. Domain adaptation via MMD
+7. Training loop (as implemented now)
+8. Evaluation metrics
+9. Deliberate deviations from the paper
+10. Known limitations
+11. Complete run guide, from a clean machine
 ================================================================================
 
 
-1. PROBLEM FORMULATION & CROSS-CHEMISTRY ADAPTATION INTUITION
+0. CHANGE LOG: WHAT WAS DONE IN THIS REVISION
 --------------------------------------------------------------------------------
-Predicting the Remaining Useful Life (RUL) of lithium-ion batteries across
-differing chemistries (e.g., LFP vs. NCM/NCA) is notoriously difficult because
-electrochemical degradation trajectories vary widely:
-  - LFP cells exhibit a flat voltage plateau and gradual capacity fade over
-    thousands of cycles (e.g., MATR / Severson dataset: 1,000 - 2,500+ cycles).
-  - NCM cells show sloping voltage curves and degrade more rapidly under high
-    temperatures and C-rates (e.g., HUST dataset: 400 - 1,200 cycles).
+Only ONE code file needed changes:  src/hybridonet-adapt/train_hybrido.py
+Everything else (model_hybrido.py, mmd_loss.py, preprocess_hybrido.py,
+visualize_model.py, investigate_model.py, test_hybrido.py) is unchanged.
 
-Standard supervised models trained on Source chemistry fail catastrophically
-when deployed directly on Target chemistry due to covariate shift in feature
-space. HybridoNet-Adapt addresses this by:
-  a) Extracting domain-invariant temporal-continuous latent representations
-     z in R^128 using an LSTM-MHA-NODE backbone.
-  b) Aligning latent distributions between source and target via Multi-Kernel
-     Maximum Mean Discrepancy (MK-MMD).
-  c) Learning dual regression heads (G_Y^S for source knowledge, G_Y^T for
-     target adaptation) and combining them via trainable trade-off parameters
-     (theta_S, theta_T).
+How the check was done: the GitHub version (commit db4162a) was compared with the
+improvement plan plus your amendments, using behavioral tests (verify_amends.py),
+not only by reading the code:
+    GitHub version before this revision : 6 of 10 checks passed
+    This revised version                : 11 of 11 checks passed
+    Project test suite (test_hybrido.py): ALL 8/8 tests still pass
+    End-to-end CLI (preprocess, train, visualize, investigate): all run cleanly
+(Tested on small synthetic data, because the real datasets could not be
+downloaded in the test environment. This proves the code paths and settings are
+correct; it says nothing about final accuracy on MATR/HUST.)
+
+STATUS OF EACH ITEM
+-------------------
+ #  Item                 Your decision                    Status in this revision
+--  -------------------  -------------------------------  -----------------------
+ 1  Epochs / patience    30 epochs, patience 8            already correct
+ 2  Source loss          combined prediction (plan)       already correct (note A)
+ 3  Theta parameters     keep current (softmax)           already correct
+ 4  LR schedule          keep scheduler, never reach 0    FIXED  (see note B)
+ 5  Weight decay         keep current (AdamW, 1e-4)       FIXED  (see note C)
+ 6  MMD weight           as per paper                     already correct
+ 7  Validation           as per paper / plan              already in place (note D)
+ 8  Predictor layers     as per paper                     already correct
+ 9  MAPE metric          as per paper                     FIXED  (see note E)
+10  Default num_runs     10 (plan, "defaults" section)    DONE   (see note F)
+
+Note A - Source loss.  Both loss terms use the COMBINED prediction, as in your plan:
+      y_comb = theta_S * y_S + theta_T * y_T
+      L = MSE( y_comb(X_S), Y_S )  +  MSE( y_comb(X_T), Y_T )  +  lambda_p * MMD
+  This was already what the GitHub version did, so no change was needed. Please be
+  aware that it is a deliberate deviation from the paper: Eq. 18 there trains the
+  source term on the source head y_S alone (Eq. 17) and only the target term on the
+  combined output (Eq. 16). (Eq. 13 in the paper is the input tensor, not the loss.)
+  Effect of the choice: theta_S and theta_T now receive gradients from source AND
+  target batches, and the target head G_Y^T is also pulled by the source labels.
+
+Note B - LR schedule.  Cosine annealing is kept and is ON by default, but it now
+  stops at a floor of  lr * 0.2  (5.0e-4 -> 1.0e-4) instead of decaying to 0, so the
+  last epochs are still trained properly. Verified: LR goes 5.0e-4 -> 1.0e-4 and
+  stays there. New flags: --lr-min-ratio (default 0.2) and --no-scheduler (fixed LR,
+  the paper's setting). The old --use-scheduler flag was removed (the GitHub
+  version had switched the scheduler OFF by default, with no floor).
+
+Note C - Optimizer.  Paper Section 4.1 states that the model is optimized with
+  AdamW. The plan claimed plain Adam. GitHub had changed AdamW to Adam; it is
+  AdamW(lr=5e-4, weight_decay=1e-4) again. (The paper does not give a weight-decay
+  value; 1e-4 is your existing setting.)
+
+Note D - Validation.  Validation RMSE picks the best epoch, computed on the combined
+  prediction over the held-out 10 % source cells (as in your plan). The paper only
+  says "model selected based on the lowest RMSE on the validation set"; it does not
+  name which predictor output is used, so this choice cannot be checked against it.
+
+Note E - MAPE.  The plan claimed the paper uses standard per-sample MAPE. Paper
+  Eq. 23 divides by y, defined right below it as the CYCLE LIFE, not by the
+  per-sample RUL:
+      MAPE = (1/n) * sum_i |y_i - y_hat_i| / y * 100
+  The GitHub version had made strict per-sample MAPE the primary metric. The primary
+  metric ("test_mape") is now the paper's definition, computed against each cell's
+  own cycle life (see Section 8). Per-sample, floor and raw MAPE stay as
+  auxiliary numbers. Sanity check on the paper's own numbers: RMSE 153 cycles on
+  cells averaging ~1,900 cycles of life is ~8 %, consistent with MAPE 7.3 %, while
+  per-sample MAPE on RUL windows near end of life would be far larger.
+
+Note F - num_runs.  The plan's "defaults" section lists num_runs = 10 (paper
+  Section 4.1: ten repetitions, predictions averaged). It is now the default, in
+  both run_benchmark() and the CLI. CONSEQUENCE: a plain run trains 10 models and
+  writes checkpoints/<name>_run1.pt ... _run10.pt (no single <name>.pt). For a quick
+  single run pass  --num-runs 1  (this writes the checkpoint path exactly as given).
 
 
-2. DATA PREPROCESSING & 18-D FEATURE EXTRACTION PIPELINE
+1. PROBLEM FORMULATION
+--------------------------------------------------------------------------------
+Predict the Remaining Useful Life (RUL) of a lithium-ion cell at ANY point in its
+life from the most recent ~30 cycles of voltage, current and capacity:
+      RUL = N_life - N_age                                          (paper Eq. 11)
+
+Both datasets in the paper are LFP/graphite A123 APR18650M1A cells (1.1 Ah), so
+the domain shift is in operating protocol, not chemistry:
+  - Source, TRI / MATR (Severson et al.): 124 cells (169 in the BatteryLife copy,
+    which adds Attia batch 4), VARIED fast-charging, identical discharge.
+    Cycle life ~150 - 2,300.
+  - Target, LHP / HUST: 77 cells, VARIED multi-stage discharge, identical
+    fast-charging. Cycle life 1,100 - 2,700 (mean 1,898).
+A model trained only on the source degrades badly on the target. HybridoNet-Adapt:
+  a) extracts temporal features z (128-D) with LSTM -> attention -> NODE;
+  b) aligns source and target features with Maximum Mean Discrepancy (MMD);
+  c) keeps two regression heads (G_Y^S, G_Y^T) blended by trainable weights
+     theta_S, theta_T.
+Note: the target cells used for adaptation are LABELED here (Eq. 18 has a target
+MSE term), even though the abstract loosely says "unlabeled target".
+
+
+2. DATA PREPROCESSING & 18-D FEATURE EXTRACTION
 --------------------------------------------------------------------------------
 Script: preprocess_hybrido.py
+Input : per-cell parquet files with voltage_V, current_A, capacity_Ah, cycle_number.
 
-Input: Raw electrochemical cycling data (voltage V, current I, charge capacity Q,
-temperature T, time t).
+Step 2.1  Per-cycle features.
+  Each signal (voltage, current, capacity) is median-filtered (kernel 3) to remove
+  spikes, then summarized by 6 statistics:
+      Mean, Std, Min, Max, Variance, Median
+  -> 3 signals x 6 statistics = 18 numbers per cycle.
 
-Step 2.1: Cycle-Level Statistical Feature Extraction
-For each cycle k, 6 summary statistics are calculated for each of 3 operational
-signals [Voltage, Current, Capacity]:
-  1. Mean:        mu = (1/M) * sum(x_m)
-  2. Std Dev:     sigma = sqrt( (1/M) * sum((x_m - mu)^2) )
-  3. Skewness:    gamma = (1/M) * sum( ((x_m - mu)/sigma)^3 )
-  4. Kurtosis:    kappa = (1/M) * sum( ((x_m - mu)/sigma)^4 ) - 3
-  5. Minimum:     min(x)
-  6. Maximum:     max(x)
+Step 2.2  Rolling windows.
+  A window covers 30 consecutive cycles. From it, 10 cycles are picked uniformly
+  (one every three cycles), giving a sample of shape (10, 3, 6), later flattened
+  to (10, 18) for the LSTM. Windows slide along the cell's whole life:
+      --window-size 30 (default)
+      --stride 10 (default; overlapping windows, more training samples)
+      --stride 30 gives the paper's non-overlapping windows.
 
-This yields a 3 x 6 = 18-dimensional feature vector per cycle:
-  x_k in R^18 = [
-    V_mean, V_std, V_skew, V_kurt, V_min, V_max,
-    I_mean, I_std, I_skew, I_kurt, I_min, I_max,
-    Q_mean, Q_std, Q_skew, Q_kurt, Q_min, Q_max
-  ]
+Step 2.3  Labels.
+  For a window ending at cycle C_end:  RUL = EOL - C_end.
+  EOL is the first cycle where capacity drops below 80 % of nominal.
+  Windows stop once C_end reaches EOL.
 
-Step 2.2: Rolling Window Sampling
-Batteries are sampled across life using a rolling sliding window:
-  - Sequence length S = 10 consecutive cycles (e.g., cycles 21 to 30)
-  - Window step / stride = 30 cycles (or configurable)
-  - Sample tensor shape: (Batch, Seq_Len=10, Channels=3, Features=6) -> flattened
-    to (Batch, 10, 18) for LSTM consumption.
-
-Step 2.3: Rolling RUL Ground Truth Calculation
-At any sample ending at cycle C_end with end-of-life cycle EOL:
-  RUL_k = EOL - C_end
-This reflects the true remaining cycle capacity at observation time.
+Output: one .npz per dataset with X, Y (RUL), sample_ids, cell_ids. A single run
+converts every dataset it finds and also writes TRI/MATR and LHP/HUST aliases.
 
 
 3. DISJOINT CELL-LEVEL PARTITIONING (ZERO-LEAKAGE GUARANTEE)
 --------------------------------------------------------------------------------
-Script: train_hybrido.py -> split_by_cell_id()
+Function: train_hybrido.py -> split_by_cell_id()
 
-Crucial Machine Learning Safeguard:
-In time-series battery data, random window shuffling creates intra-battery data
-leakage (windows from cycle 30 and cycle 60 of the SAME physical cell ending up
-in train and test, inflating accuracy artificially).
-
-HybridoNet-Adapt enforces strict Cell-ID grouping:
-  - Source Domain (MATR):
-      * 90% unique physical cells -> Source Training set
-      * 10% unique physical cells -> Validation set (model checkpoint selection)
-  - Target Domain (HUST):
-      * 60% unique physical cells -> Target Adaptation set (unlabeled/labeled)
-      * 40% unique physical cells -> Blind Target Test set (never touched until final eval)
-
-Result: The test set consists entirely of unseen battery cells.
+Windows from the same physical cell are highly correlated, so splits are made by
+CELL, never by window:
+  - Source (MATR):
+      90 % of cells -> source training set
+      10 % of cells -> validation set (checkpoint selection)
+  - Target (HUST):
+      60 % of cells -> target adaptation set (LABELED; used in the target MSE loss
+                       and in MMD)
+      40 % of cells -> blind test set (used once, at the very end)
+The test set contains only unseen cells. Splits use a fixed seed (42).
 
 
-4. FEATURE & RUL NORMALIZATION (ANTI-SATURATION SCALING)
+4. FEATURE & RUL NORMALIZATION
 --------------------------------------------------------------------------------
-Classes: fit_and_transform_features_18d, RobustRULScaler
+Step 4.1  Features.  A MinMaxScaler is fitted on the source-training windows plus the
+  target-adaptation windows (over all samples and time steps, per each of the 18
+  features), then applied to validation and blind-test windows. Values are clipped
+  to [-0.5, 1.5] as a safety net. The blind test set never influences the scaler.
 
-Step 4.1: 18-D Feature Scaling
-A single Min-Max scaler is fitted ONLY on the Source Training windows across
-both sample and time dimensions:
-  X_scaled = (X - X_min) / (X_max - X_min + 1e-8)
-The same scaler transforms Source Val, Target Adaptation, and Target Test,
-preventing target information from leaking into feature scaling.
-
-Step 4.2: Robust Physical RUL Normalization
-The RUL targets are normalized to [0, 1] using a fixed physical ceiling
-(default 2500 cycles or dynamically matched to max life):
-  y_scaled = RUL / Y_MAX_CEILING
-  RUL_pred = y_pred_scaled * Y_MAX_CEILING
-
-This ensures targets do not saturate at 0 or 1, preserving strong gradient flow
-through the terminal Sigmoid activation in the predictor heads.
+Step 4.2  RUL.  Labels are scaled into [0, 1] by a fixed physical ceiling
+  (default 2500 cycles):  y_scaled = RUL / ceiling;  RUL_pred = y_pred * ceiling.
+  This keeps targets away from the saturated ends of the final Sigmoid.
+  See Section 10 for a known problem when target RUL exceeds the ceiling.
 
 
-5. DEEP HYBRID NEURAL ARCHITECTURE (STAGE-BY-STAGE BREAKDOWN)
+5. NEURAL ARCHITECTURE                                   (file: model_hybrido.py)
 --------------------------------------------------------------------------------
-File: model_hybrido.py
+Input x: (Batch, 10, 18)
 
-Input Tensor x: Shape (Batch, 10, 18)
-
-5.1 Two-Layer LSTM Temporal Feature Encoder (FeatureExtractor.lstm):
-  - Input: 18 features per cycle step
-  - Architecture: 2 stacked LSTM layers, hidden_size = 128
-  - Dropout: 0.1 between layers
-  - Output: H_lstm in R^(Batch, 10, 128)
-  - Role: Captures long-range electrochemical degradation trends across the 10 cycles.
-
-5.2 Multihead Scaled Dot-Product Self-Attention (FeatureExtractor.mha):
-  - Embed Dimension = 128, Heads = 4 (head dimension = 32)
-  - Attention formula: Attn(Q, K, V) = softmax(Q K^T / sqrt(32)) V
-  - Residual connection: H_attn = LayerNorm(H_lstm + Attn(H_lstm, H_lstm, H_lstm))
-  - Output: H_attn in R^(Batch, 10, 128)
-  - Role: Dynamically weighs the relative degradation importance of individual
-    cycles within the 10-cycle window.
-
-5.3 Deterministic Attention Step Selection (h_{t=-1}):
-  - As published in Tran et al. 2025, the model extracts the representation from
-    the LAST time step of the attention sequence:
-      h_selected = H_attn[:, -1, :] in R^(Batch, 128)
-  - Role: Encodes the most recent accumulated battery state into a fixed 128-D vector.
-
-5.4 Modular Neural Ordinary Differential Equation (NODE) Block:
-  - Class: NeuralODEBlock with ODEFunc(hidden_dim=128)
-  - Paper-faithful linear derivative: dz/dt = W * z + b (single Linear(128, 128))
-  - Numerical Integration: Runge-Kutta 4th Order (RK4) over continuous interval [0, 1]:
-      k1 = f(t, z)
-      k2 = f(t + dt/2, z + (dt/2)*k1)
-      k3 = f(t + dt/2, z + (dt/2)*k2)
-      k4 = f(t + dt, z + dt*k3)
-      z_{next} = z + (dt/6) * (k1 + 2*k2 + 2*k3 + k4)
-  - Number of integration steps: 2 (dt = 0.5)
-  - Role: Models continuous-time battery aging dynamics between discrete measurement
-    intervals, regularizing the latent trajectory against discrete sampling noise.
-
-5.5 Post-NODE Normalization (FeatureExtractor.node_layer_norm):
-  - LayerNorm(128) applied directly after the NODE integration output,
-    matching Table 2 of Tran et al. 2025.
-  - Produces latent embedding z in R^(Batch, 128).
-
-5.6 Dual Predictor Heads (Source Head G_Y^S & Target Head G_Y^T):
-  - Both heads share the exact Table 2 specification:
-      Linear(128 -> 64) -> ReLU() -> BatchNorm1d(64) -> Dropout(0.1) ->
-      Linear(64 -> 32)  -> ReLU() -> BatchNorm1d(32) -> Dropout(0.1) ->
-      Linear(32 -> 1)   -> Sigmoid()
-  - Output: Normalized RUL estimate in range (0, 1).
-  - Source Head G_Y^S: Retains degradation knowledge from abundant source data.
-  - Target Head G_Y^T: Specializes on target chemistry characteristics.
-
-5.7 Softmax-Constrained Convex Trade-Off Formulation (theta_S, theta_T):
-  - Target Prediction Formula:
-      Y_hat = theta_S * G_Y^S(z) + theta_T * G_Y^T(z)
-  - Parameterization:
-      theta_logits = nn.Parameter(torch.zeros(2))  # [0.0, 0.0]
-      [theta_S, theta_T] = softmax(theta_logits)
-  - Guarantees:
-      * theta_S + theta_T == 1.0 (strict convex combination)
-      * theta_S in (0, 1) and theta_T in (0, 1) at all times
-      * Unbiased initialization: starts at 0.5 / 0.5, allowing data gradients
-        to shift weight towards the more reliable head.
+5.1  Two-layer LSTM (hidden 128, dropout 0.1) -> H_lstm (Batch, 10, 128).
+5.2  Multi-head self-attention (4 heads, embed 128), with a residual connection and
+     LayerNorm -> H_attn (Batch, 10, 128).
+5.3  The LAST time step is selected: h = H_attn[:, -1, :]  (Batch, 128).
+5.4  Neural ODE block: dz/dt = W*z + b (one linear layer), integrated with RK4 over
+     t in [0, 1] using 2 steps. It models continuous-time ageing dynamics.
+5.5  LayerNorm(128) after the ODE -> latent z (Batch, 128).
+5.6  Two identical predictor heads, G_Y^S (source) and G_Y^T (target), exactly the
+     paper's Table 2:
+         Linear(128->64) -> ReLU -> BatchNorm1d(64) -> Dropout(0.1) ->
+         Linear(64->32)  -> ReLU -> BatchNorm1d(32) -> Dropout(0.1) ->
+         Linear(32->1)   -> Sigmoid
+     (BatchNorm is the default; --norm-type layernorm is still available.)
+5.7  Trade-off weights.  Target prediction (paper Eq. 16):
+         Y_hat_T = theta_S * G_Y^S(z) + theta_T * G_Y^T(z)
+     theta_S, theta_T = softmax(theta_logits), logits start at [0, 0], so both
+     start at 0.5 and always sum to 1 (kept as-is by your decision; the paper uses
+     two free scalars initialised at 0.5).
 
 
-6. DOMAIN ADAPTATION VIA MULTI-KERNEL MMD & DYNAMIC SCHEDULING
+6. DOMAIN ADAPTATION VIA MMD                                 (file: mmd_loss.py)
 --------------------------------------------------------------------------------
-File: mmd_loss.py -> MMDLoss
+MMD measures the distance between the source feature distribution and the target
+feature distribution:
+      MMD^2 = E[k(zs,zs')] - 2 E[k(zs,zt)] + E[k(zt,zt')]
+The implementation uses 5 Gaussian kernels with geometrically spaced bandwidths
+(centered on an adaptive bandwidth) and a scale normalization for stability. The
+paper (Eq. 19) describes a single Gaussian kernel; see Section 9.
 
-Maximum Mean Discrepancy (MMD) measures the distance between the source latent
-distribution P(Z_S) and the target latent distribution Q(Z_T) in a Reproducing
-Kernel Hilbert Space (RKHS):
-  MMD^2(Z_S, Z_T) = E[k(z_s, z_s')] - 2*E[k(z_s, z_t)] + E[k(z_t, z_t')]
-
-Multi-Kernel Formulation:
-  k(x, x') = sum_{m=1}^5 exp( - ||x - x'||^2 / (2 * sigma_m^2) )
-  Bandwidths sigma_m are geometrically spaced around median pairwise distance:
-    sigma_m = sigma_base * (kernel_mul ^ (m - 2))
-
-Dynamic Lambda Adaptation Schedule:
-At early epochs, latent features are unformed; forcing strong domain alignment
-causes representation collapse. Following paper Eq. (12):
-  lambda_p = 2 / (1 + exp(-gamma * p)) - 1
-  where gamma = 10.0, and p = epoch / total_epochs in [0, 1].
-  - At epoch 1 (p ~ 0):  lambda_p ~ 0.0  (focus purely on source regression)
-  - At mid-training:     lambda_p smoothly ramps up
-  - At final epochs:     lambda_p -> 1.0  (full domain invariant alignment)
+Dynamic weight (paper Eq. 21):
+      lambda_p = 2 / (1 + exp(-10 * epoch/epochs)) - 1
+It grows from about 0.17 at epoch 1 of 30 to about 1.0 at the end, so alignment is
+gentle early on and strong late. The loss term is  lambda_p * MMD  with NO extra
+multiplier (mmd_weight defaults to 1.0; an earlier 0.1 multiplier was removed).
 
 
-7. TRAINING LOOP & OPTIMIZATION MECHANICS
+7. TRAINING LOOP (AS IMPLEMENTED NOW)                (train_hybrido_session)
 --------------------------------------------------------------------------------
-File: train_hybrido.py -> train_hybrido_session()
+7.1  Optimizer: AdamW, lr 0.0005, weight_decay 1e-4, gradient-norm clipping 5.0.
 
-7.1 Pure Adam Optimizer & Fixed Learning Rate
-  - Optimizer: Standard Adam (no weight decay, matching paper):
-      optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
-  - Fixed learning rate: 0.0005 throughout training (no cosine decay default).
+7.2  LR schedule: CosineAnnealingLR with T_max = number of epochs and
+     eta_min = lr * lr_min_ratio (default 0.2):
+         lr_t = 1e-4 + (5e-4 - 1e-4) * (1 + cos(pi * t / T)) / 2
+     It steps once per epoch and never reaches zero. The LR printed in the epoch
+     log is the value AFTER that epoch's step. If early stopping ends training
+     before the last epoch, the floor is simply not reached.
+     --no-scheduler gives a constant 0.0005 (the paper's fixed LR).
 
-7.2 Unified Combined Prediction Loss (Paper Equation 13)
-  The total objective function is:
-    L_total = MSE(Y_hat_S_comb, Y_S) + MSE(Y_hat_T_comb, Y_T) + lambda_p * MMD(Z_S, Z_T)
-  where:
-    Y_hat_S_comb = theta_S * G_Y^S(Z_S) + theta_T * G_Y^T(Z_S)
-    Y_hat_T_comb = theta_S * G_Y^S(Z_T) + theta_T * G_Y^T(Z_T)
-  Both source and target losses train the combined prediction, allowing the
-  trade-off parameters (theta_S, theta_T) to receive gradient signals from both
-  domains simultaneously.
+7.3  Each step takes one source batch and one target batch:
+       source term : MSE( theta_S*G_Y^S(z_S) + theta_T*G_Y^T(z_S), Y_S )   (combined)
+       target term : MSE( theta_S*G_Y^S(z_T) + theta_T*G_Y^T(z_T), Y_T )   (combined)
+       MMD term    : lambda_p * MMD(z_S, z_T)
+       total loss  = source + target + MMD term
+     Both terms use the combined prediction (see Note A: the paper's Eq. 18 uses the
+     source head alone for the source term). Gradients: the feature extractor, both
+     heads and the theta logits are all trained by both terms.
 
-7.3 Validation-Driven Model Selection on Combined Output
-  - Validation occurs after every epoch on the held-out 10% Source cells.
-  - The model computes the combined prediction Y_hat_comb on validation cells.
-  - The checkpoint with the lowest Validation RMSE is saved and restored for
-    the final blind target test evaluation.
+7.4  Validation after every epoch: combined prediction on the held-out source cells;
+     RMSE in cycles. The epoch with the lowest validation RMSE is kept.
 
-7.4 Configured Schedule: 30 Epochs with Early Stopping Patience 8
-  - Total Epochs: 30
-  - Early Stopping: Halts training if Validation RMSE does not improve for 8
-    consecutive epochs, preventing overfitting while ensuring adequate training.
+7.5  Schedule: up to 30 epochs; training stops early if validation RMSE has not
+     improved for 8 consecutive epochs (--early-stop-patience 0 disables it).
+
+7.6  Final evaluation: the best checkpoint is loaded and the blind target test cells
+     are scored exactly once with the combined prediction.
+
+7.7  Repetitions (default 10, seeds 42..51): each run is trained and tested
+     independently; the final prediction is the average of the runs' test
+     predictions (paper Section 4.1). Checkpoints are saved as <name>_run1.pt ...
+     <name>_run10.pt. With --num-runs 1 the checkpoint is written exactly to
+     --checkpoint-path.
 
 
-8. EVALUATION METRICS FORMULATION
+8. EVALUATION METRICS
 --------------------------------------------------------------------------------
-The benchmark reports all metrics on the blind target test set (40% unseen cells):
+Reported on the blind target test cells:
 
-1. Root Mean Square Error (RMSE):
-     RMSE = sqrt( (1/N) * sum_{i=1}^N (y_i - y_hat_i)^2 )   [Cycles]
+1. RMSE (cycles):  sqrt( mean( (y - y_hat)^2 ) )
+2. R2:             1 - sum((y - y_hat)^2) / sum((y - mean(y))^2)
+3. MAPE, paper definition (Eq. 23)          <- PRIMARY, result key "test_mape"
+       MAPE = mean_i( |y_i - y_hat_i| / N_life(cell of i) ) * 100 %
+   y_i, y_hat_i are the true and predicted RUL of window i; N_life is the TOTAL
+   cycle life of the cell that window i belongs to. Because N_life is far larger
+   than the RUL, the metric stays bounded near end of life.
+   The .npz files store RUL only, so N_life is recovered per cell:
+       N_life(cell) = max(RUL over that cell's windows) + window size (30)
+   because RUL = N_life - current_cycle and a cell's first window ends at cycle 30.
+   This was verified to be exact on synthetic cells (true lives 300 / 517 / 421 were
+   recovered exactly through the real preprocessing code). If you preprocess with
+   a different --window-size the estimate is off by that difference (a few cycles).
+4. Per-sample MAPE (auxiliary):  mean( |y - y_hat| / max(y, 1) ) * 100 %
+   Explodes near end of life; shown only for comparison.
+5. Floor MAPE (auxiliary): per-sample MAPE restricted to windows with RUL >= 50.
+6. Raw scikit-learn MAPE (auxiliary): unbounded near end of life.
 
-2. Coefficient of Determination (R²):
-     R² = 1 - sum((y_i - y_hat_i)^2) / sum((y_i - y_mean)^2)
 
-3. Standard Per-Sample MAPE:
-     MAPE_std = (1/N) * sum_{i=1}^N ( |y_i - y_hat_i| / max(y_i, 1.0) ) * 100%
-
-4. Paper's Nominal-Cycle MAPE (Tran et al. Section 4.3):
-     MAPE_paper = (1/N) * sum_{i=1}^N ( |y_i - y_hat_i| / max(y_cycle_life) ) * 100%
-
-5. Floor MAPE (RUL >= 50 cycles):
-     Evaluates MAPE excluding near-EOL windows where division by tiny cycle counts
-     creates distortion.
-
-
-9. STEP-BY-STEP EXECUTION COMMANDS & TESTING INSTRUCTIONS
+9. DELIBERATE DEVIATIONS FROM THE PAPER
 --------------------------------------------------------------------------------
+Chosen by you or by earlier project decisions; listed so they can be stated openly.
+  - Source loss: combined prediction y_comb (your plan) vs the paper's Eq. 18,
+    which uses the source head y_S alone for the source term.
+  - theta parameterisation: softmax (sums to 1) vs the paper's free scalars.
+  - Learning rate: cosine decay to a floor vs the paper's fixed 0.0005.
+  - Epochs: up to 30 with early stopping (patience 8) vs the paper's 10 epochs.
+  - MMD kernel: 5 Gaussian kernels with adaptive bandwidth vs a single Gaussian.
+  - Weight decay 1e-4 (the paper says AdamW but gives no value).
+  - Validation head: combined prediction on source validation cells (paper silent).
+  - Data splits: the paper uses the TRI training subset (41 cells) as source and
+    subsets of the LHP cells as targets. This project splits all MATR cells 90/10
+    and all HUST cells 60/40 by cell. Absolute numbers should therefore not be
+    expected to match the paper's table exactly. Use --severson-only for the
+    124-cell version of MATR.
+  - The feature scaler is fitted on source-train + target-adaptation windows.
 
-Step 1: Verify Codebase Integrity (Run Automated Test Suite)
-  python src/hybridonet-adapt/test_hybrido.py
-  (Expected output: ALL 8/8 HARDENED TESTS PASSED SUCCESSFULLY)
 
-Step 2: Preprocess Datasets (Extract 18-D Rolling Features)
-  Source dataset (MATR / LFP):
-    python src/hybridonet-adapt/preprocess_hybrido.py \
-      --dataset matr \
-      --raw-dir data/hybridonet/raw/matr \
-      --output data/hybridonet/processed/MATR_raw_features.npz \
-      --window-size 10 \
-      --stride 30
+10. KNOWN LIMITATIONS (NOT CHANGED IN THIS REVISION)
+--------------------------------------------------------------------------------
+  - RUL scaler ceiling.  If a target RUL exceeds the source's ceiling, RobustRULScaler
+    expands its ceiling part-way through setup, so source labels and target labels
+    end up scaled differently. MATR -> HUST does not trigger this. Warning sign in
+    the log: "Auto-expanded physical RUL ceiling". If you see it, rerun with
+    --rul-ceiling set above the largest RUL in BOTH datasets, and pass the same
+    value to visualize_model.py and investigate_model.py.
+  - Checkpoint selection uses source-domain validation cells only, so the chosen
+    epoch is not necessarily the best one for the target.
+  - test_hybrido.py writes checkpoints/hybrido_best.pt in the current directory.
+    Run the tests BEFORE training, not after.
+  - src/hybridonet-adapt/download_datasets.py extracts .pkl files that the
+    preprocessor cannot read. Use src/downloads/download_batterylife_data.py.
+  - The data download itself has not been tested end to end (Zenodo was not
+    reachable from the test environment).
 
-  Target dataset (HUST / NCM):
-    python src/hybridonet-adapt/preprocess_hybrido.py \
-      --dataset hust \
-      --raw-dir data/hybridonet/raw/hust \
-      --output data/hybridonet/processed/HUST_raw_features.npz \
-      --window-size 10 \
-      --stride 30
 
-Step 3: Run HybridoNet-Adapt Training & Benchmark
-  Single Run (30 epochs, patience 8, batchnorm, fixed lr 0.0005):
+11. COMPLETE RUN GUIDE, FROM A CLEAN MACHINE
+--------------------------------------------------------------------------------
+Run every command from the repository root. Bash on Linux, macOS, WSL or Colab.
+
+Step 0: get the code and set up Python
+    git clone https://github.com/divyansh070/ashwini_prof_project.git
+    cd ashwini_prof_project
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install torch numpy pandas pyarrow scipy scikit-learn matplotlib
+
+Step 1: verify the code (do this BEFORE training)
+    python src/hybridonet-adapt/test_hybrido.py
+    (expected: ALL 8/8 HARDENED TESTS PASSED SUCCESSFULLY)
+
+Step 2: download and convert the data (MATR = source, HUST = target)
+    python src/downloads/download_batterylife_data.py --skip CALCE SNL RWTH Stanford
+    ls data/real_processed/matr | wc -l      # roughly 169
+    ls data/real_processed/hust | wc -l      # roughly 77
+
+Step 3: extract features (ONE command handles both datasets)
+    python src/hybridonet-adapt/preprocess_hybrido.py
+    (paper's non-overlapping windows: add  --window-size 30 --stride 30)
+
+Step 4: train
+  Quick single run (recommended first):
     python src/hybridonet-adapt/train_hybrido.py \
       --source data/hybridonet/processed/MATR_raw_features.npz \
       --target data/hybridonet/processed/HUST_raw_features.npz \
-      --epochs 30 \
-      --early-stop-patience 8 \
-      --batch-size 128 \
-      --lr 0.0005 \
-      --norm-type batchnorm \
+      --epochs 30 --early-stop-patience 8 --batch-size 128 --lr 0.0005 \
+      --norm-type batchnorm --num-runs 1 \
       --checkpoint-path checkpoints/hybrido_best.pt
 
-  Full Paper Multi-Seed Benchmark (10 Repetitions with Ensemble Averaging):
+  Full paper benchmark (10 runs, ensemble averaging; this is now the default):
     python src/hybridonet-adapt/train_hybrido.py \
       --source data/hybridonet/processed/MATR_raw_features.npz \
       --target data/hybridonet/processed/HUST_raw_features.npz \
-      --epochs 30 \
-      --early-stop-patience 8 \
-      --num-runs 10 \
-      --batch-size 128 \
-      --lr 0.0005 \
-      --norm-type batchnorm \
+      --epochs 30 --early-stop-patience 8 --num-runs 10 --batch-size 128 \
+      --lr 0.0005 --norm-type batchnorm \
       --checkpoint-path checkpoints/hybrido_ensemble.pt
+    (writes checkpoints/hybrido_ensemble_run1.pt ... _run10.pt)
 
-Step 4: Visualize Results & Trajectories
+  Optional switches:
+    --no-scheduler        fixed LR 0.0005 (the paper's setting)
+    --lr-min-ratio 0.2    floor of the cosine schedule (fraction of --lr)
+    --severson-only       use the 124 Severson cells of MATR
+
+Step 5: visualize and inspect (use the same --norm-type / --severson-only /
+        --rul-ceiling as in training)
     python src/hybridonet-adapt/visualize_model.py \
       --checkpoint checkpoints/hybrido_best.pt \
       --source data/hybridonet/processed/MATR_raw_features.npz \
       --target data/hybridonet/processed/HUST_raw_features.npz \
       --norm-type batchnorm
 
-Step 5: Diagnostic Model Inspection
     python src/hybridonet-adapt/investigate_model.py \
       --checkpoint checkpoints/hybrido_best.pt \
       --source data/hybridonet/processed/MATR_raw_features.npz \
       --target data/hybridonet/processed/HUST_raw_features.npz \
       --norm-type batchnorm
+    (after the 10-run benchmark, point --checkpoint at
+     checkpoints/hybrido_ensemble_run1.pt or any other _runK.pt)
+
+Optional: re-check that the amendments are in place
+    python verify_amends.py src/hybridonet-adapt
 ================================================================================
